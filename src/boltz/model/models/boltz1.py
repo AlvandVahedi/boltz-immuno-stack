@@ -1,6 +1,10 @@
 import gc
+import math
 import random
+from pathlib import Path
 from typing import Any, Optional
+
+import numpy as np
 
 import torch
 import torch._dynamo
@@ -9,6 +13,7 @@ from torch import Tensor, nn
 from torchmetrics import MeanMetric
 
 import boltz.model.layers.initialize as init
+from boltz.data.types import Connection, Structure
 from boltz.data import const
 from boltz.data.feature.symmetry import (
     minimum_lddt_symmetry_coords,
@@ -22,9 +27,11 @@ from boltz.model.loss.validation import (
     compute_plddt_mae,
     factored_lddt_loss,
     factored_token_lddt_dist_loss,
+    compute_weighted_mhc_rmsds,
     weighted_minimum_rmsd,
 )
 from boltz.model.modules.confidence import ConfidenceModule
+from boltz.data.write.writer import write_validation_predictions
 from boltz.model.modules.diffusion import AtomDiffusion
 from boltz.model.modules.encoders import RelativePositionEncoder
 from boltz.model.modules.trunk import (
@@ -276,7 +283,7 @@ class Boltz1(LightningModule):
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
-        max_parallel_samples: Optional[int] = None,
+        max_parallel_samples: Optional[int] = 1,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
         dict_out = {}
@@ -615,6 +622,217 @@ class Boltz1(LightningModule):
         norm = torch.tensor([p.norm(p=2) ** 2 for p in parameters]).sum().sqrt()
         return norm
 
+    def _build_alignment_masks(
+        self,
+        batch: dict[str, Tensor],
+        record_ids: list[str],
+        base_structures: list[Optional[Structure]],
+        batch_idx: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        batch_size, num_atoms, _ = batch["atom_to_token"].shape
+        device = batch["atom_pad_mask"].device
+
+        align_base_mask = torch.zeros((batch_size, num_atoms), dtype=torch.bool, device=device)
+        heavy_calc_mask = torch.zeros_like(align_base_mask)
+        peptide_calc_mask = torch.zeros_like(align_base_mask)
+        backbone_names = set(const.protein_backbone_atom_names)
+
+        for structure_idx in range(batch_size):
+            record_id = (
+                record_ids[structure_idx]
+                if structure_idx < len(record_ids)
+                else f"batch_{batch_idx}_{structure_idx}"
+            )
+            structure = (
+                base_structures[structure_idx]
+                if structure_idx < len(base_structures)
+                else None
+            )
+
+            atom_to_token = batch["atom_to_token"][structure_idx].bool()
+            entity_ids = batch["entity_id"][structure_idx]
+            present_atom = batch["atom_pad_mask"][structure_idx].bool()
+
+            unique_entities = torch.unique(entity_ids)
+            res_counts = {int(e.item()): int((entity_ids == e).sum().item()) for e in unique_entities}
+            if not res_counts:
+                print(f"Warning: no entities found for structure {structure_idx}.")
+                continue
+
+            peptide_entity = min(res_counts, key=res_counts.get)
+            heavy_candidates = {k: v for k, v in res_counts.items() if k != peptide_entity}
+            heavy_entity = max(heavy_candidates, key=heavy_candidates.get) if heavy_candidates else peptide_entity
+
+            tok_is_pep = (entity_ids == peptide_entity)
+            tok_is_heavy = (entity_ids == heavy_entity)
+
+            atom_pep = atom_to_token[:, tok_is_pep].any(dim=1)
+            atom_heavy = atom_to_token[:, tok_is_heavy].any(dim=1)
+
+            atom_heavy = atom_heavy & ~atom_pep
+            atom_pep = atom_pep & present_atom
+            atom_heavy = atom_heavy & present_atom
+
+            if atom_heavy.sum() < 3 or atom_pep.sum() < 3:
+                print(
+                    f"Insufficient atoms for alignment in record {record_id}"
+                )
+                continue
+
+            align_mask = atom_heavy | atom_pep
+            heavy_mask = atom_heavy.clone()
+            peptide_mask = atom_pep.clone()
+            align_mode = "all atoms"
+            calc_mode = "all atoms"
+
+            if structure is not None:
+                valid_mask = present_atom
+                valid_count = int(valid_mask.sum().item())
+                if valid_count == structure.atoms.shape[0]:
+                    atoms = structure.atoms
+                    chains = structure.chains
+
+                    def decode_name(code_row: np.ndarray) -> str:
+                        chars = [chr(int(c) + 32) for c in code_row if c > 0]
+                        return "".join(chars)
+
+                    atom_names = np.array([decode_name(row) for row in atoms["name"]])
+
+                    heavy_all_base = np.zeros(structure.atoms.shape[0], dtype=bool)
+                    peptide_all_base = np.zeros_like(heavy_all_base)
+                    heavy_ca_base = np.zeros_like(heavy_all_base)
+                    peptide_ca_base = np.zeros_like(heavy_all_base)
+
+                    for chain in chains:
+                        start = int(chain["atom_idx"])
+                        end = start + int(chain["atom_num"])
+                        entity = int(chain["entity_id"])
+
+                        if entity == heavy_entity:
+                            heavy_all_base[start:end] = True
+                            ca_indices = np.where(atom_names[start:end] == "CA")[0] + start
+                            if ca_indices.size > 0:
+                                heavy_ca_base[ca_indices] = True
+                        if entity == peptide_entity:
+                            peptide_all_base[start:end] = True
+                            ca_indices = np.where(atom_names[start:end] == "CA")[0] + start
+                            if ca_indices.size > 0:
+                                peptide_ca_base[ca_indices] = True
+
+                    heavy_backbone_base = heavy_all_base & np.isin(atom_names, list(backbone_names))
+                    peptide_backbone_base = peptide_all_base & np.isin(atom_names, list(backbone_names))
+                    align_ca_base = heavy_ca_base | peptide_ca_base
+
+                    def pad_mask(base_mask: np.ndarray) -> torch.Tensor:
+                        mask_full = torch.from_numpy(base_mask).to(device=device, dtype=torch.bool)
+                        mask_padded = torch.zeros_like(align_mask)
+                        mask_padded[valid_mask] = mask_full
+                        return mask_padded
+
+                    if align_ca_base.sum() >= 3:
+                        align_mask = pad_mask(align_ca_base)
+                        align_mode = "CA"
+
+                    if heavy_ca_base.sum() >= 3:
+                        heavy_mask = pad_mask(heavy_ca_base)
+                    elif heavy_backbone_base.sum() >= 3:
+                        heavy_mask = pad_mask(heavy_backbone_base)
+                    else:
+                        heavy_mask = pad_mask(heavy_all_base)
+
+                    if peptide_ca_base.sum() >= 3:
+                        peptide_mask = pad_mask(peptide_ca_base)
+                        calc_mode = "CA"
+                    elif peptide_backbone_base.sum() >= 3:
+                        peptide_mask = pad_mask(peptide_backbone_base)
+                        calc_mode = "backbone"
+                    else:
+                        peptide_mask = pad_mask(peptide_all_base)
+                else:
+                    print(
+                        f"Warning: atom count mismatch for record '{record_id}': "
+                        f"mask has {valid_count} atoms, structure has {structure.atoms.shape[0]}."
+                    )
+
+            align_base_mask[structure_idx] = align_mask
+            heavy_calc_mask[structure_idx] = heavy_mask
+            peptide_calc_mask[structure_idx] = peptide_mask
+            print(
+                f"[debug] structure {structure_idx} entities: {res_counts} | heavy={heavy_entity} peptide={peptide_entity} | "
+                f"align_mode={align_mode} calc_mode={calc_mode}"
+            )
+            print(
+                f"Align atoms: {int(align_mask.sum().item())} | Calc atoms: {int(peptide_mask.sum().item())}"
+            )
+
+        return align_base_mask, heavy_calc_mask, peptide_calc_mask
+
+    def _extract_record_ids(self, batch: dict[str, Tensor], batch_idx: int) -> list[str]:
+        record_ids = batch.get("record_id", None)
+        if record_ids is None:
+            return [f"batch_{batch_idx}_{idx}" for idx in range(batch["atom_to_token"].shape[0])]
+        if isinstance(record_ids, torch.Tensor):
+            return [str(r.item()) for r in record_ids]
+        return [str(r) for r in record_ids]
+
+    @staticmethod
+    def _extract_structure_paths(batch: dict[str, Tensor], count: int) -> list[Optional[str]]:
+        structure_paths = batch.get("structure_path", None)
+        if structure_paths is None:
+            return [None] * count
+        return [str(path) if path is not None else None for path in structure_paths]
+
+    def _load_structure_from_npz(self, path: Path) -> Optional[Structure]:
+        try:
+            data = np.load(path)
+        except FileNotFoundError:
+            print(f"Warning: structure file not found at '{path}'.")
+            return None
+        except Exception as e:
+            print(f"Warning: failed to read structure file '{path}': {e}")
+            return None
+
+        chains = data["chains"]
+        if "cyclic_period" not in chains.dtype.names:
+            new_dtype = chains.dtype.descr + [("cyclic_period", "i4")]
+            new_chains = np.empty(chains.shape, dtype=new_dtype)
+            for name in chains.dtype.names:
+                new_chains[name] = chains[name]
+            new_chains["cyclic_period"] = 0
+            chains = new_chains
+
+        try:
+            structure = Structure(
+                atoms=data["atoms"],
+                bonds=data["bonds"],
+                residues=data["residues"],
+                chains=chains,
+                connections=data["connections"].astype(Connection),
+                interfaces=data["interfaces"],
+                mask=data["mask"],
+            )
+        except Exception as e:
+            print(f"Warning: failed to construct Structure from '{path}': {e}")
+            return None
+
+        try:
+            return structure.remove_invalid_chains()
+        except Exception as e:
+            print(f"Warning: failed to clean structure from '{path}': {e}")
+            return None
+
+    def _load_structures(self, structure_paths: list[Optional[str]]) -> list[Optional[Structure]]:
+        structures: list[Optional[Structure]] = []
+        for path_str in structure_paths:
+            if path_str is None:
+                structures.append(None)
+                continue
+            structure = self._load_structure_from_npz(Path(path_str))
+            if structure is None:
+                print(f"Skipping CIF write for record path '{path_str}' (structure load failed).")
+            structures.append(structure)
+        return structures
+
     def validation_step(self, batch: dict[str, Tensor], batch_idx: int):
         # Compute the forward pass
         n_samples = self.validation_args.diffusion_samples
@@ -626,8 +844,7 @@ class Boltz1(LightningModule):
                 diffusion_samples=n_samples,
                 run_confidence_sequentially=self.validation_args.run_confidence_sequentially,
             )
-
-        except RuntimeError as e:  # catch out of memory exceptions
+        except RuntimeError as e:
             if "out of memory" in str(e):
                 print("| WARNING: ran out of memory, skipping batch")
                 torch.cuda.empty_cache()
@@ -637,51 +854,62 @@ class Boltz1(LightningModule):
                 raise e
 
         try:
-            # Compute distogram LDDT
-            boundaries = torch.linspace(2, 22.0, 63)
-            lower = torch.tensor([1.0])
-            upper = torch.tensor([22.0 + 5.0])
-            exp_boundaries = torch.cat((lower, boundaries, upper))
-            mid_points = ((exp_boundaries[:-1] + exp_boundaries[1:]) / 2).to(
-                out["pdistogram"]
+            true_coords, _, _, _ = self.get_true_coordinates(
+                batch=batch,
+                out=out,
+                diffusion_samples=n_samples,
+                symmetry_correction=self.validation_args.symmetry_correction,
             )
 
-            # Compute predicted dists
-            preds = out["pdistogram"]
-            pred_softmax = torch.softmax(preds, dim=-1)
-            pred_softmax = pred_softmax.argmax(dim=-1)
-            pred_softmax = torch.nn.functional.one_hot(
-                pred_softmax, num_classes=preds.shape[-1]
-            )
-            pred_dist = (pred_softmax * mid_points).sum(dim=-1)
-            true_center = batch["disto_center"]
-            true_dists = torch.cdist(true_center, true_center)
 
-            # Compute lddt's
-            batch["token_disto_mask"] = batch["token_disto_mask"]
-            disto_lddt_dict, disto_total_dict = factored_token_lddt_dist_loss(
-                feats=batch,
-                true_d=true_dists,
-                pred_d=pred_dist,
+            record_ids = self._extract_record_ids(batch, batch_idx)
+
+            structure_paths = self._extract_structure_paths(batch, len(record_ids))
+
+            base_structures = self._load_structures(structure_paths)
+
+            batch_size = batch['atom_to_token'].shape[0]
+            _, _, peptide_calc_mask = self._build_alignment_masks(
+                batch=batch,
+                record_ids=record_ids,
+                base_structures=base_structures,
+                batch_idx=batch_idx,
             )
 
-            true_coords, rmsds, best_rmsds, true_coords_resolved_mask = (
-                self.get_true_coordinates(
-                    batch=batch,
-                    out=out,
-                    diffusion_samples=n_samples,
-                    symmetry_correction=self.validation_args.symmetry_correction,
-                )
+            sample_metrics = compute_weighted_mhc_rmsds(
+                out=out,
+                true_coords=true_coords,
+                batch=batch,
+                peptide_mask=peptide_calc_mask,
+                n_samples=n_samples,
+                nucleotide_weight=self.nucleotide_rmsd_weight,
+                ligand_weight=self.ligand_rmsd_weight,
             )
 
-            all_lddt_dict, all_total_dict = factored_lddt_loss(
-                feats=batch,
-                atom_mask=true_coords_resolved_mask,
-                true_atom_coords=true_coords,
-                pred_atom_coords=out["sample_atom_coords"],
-                multiplicity=n_samples,
+            whole_values = [m.rmsd_whole for m in sample_metrics if not math.isnan(m.rmsd_whole)]
+            peptide_values = [m.rmsd_peptide for m in sample_metrics if not math.isnan(m.rmsd_peptide)]
+
+            if whole_values:
+                whole_mean = torch.tensor(whole_values, device=out["sample_atom_coords"].device, dtype=torch.float32).mean()
+                self.log("val/weighted_rmsd_whole", whole_mean, prog_bar=False, sync_dist=True, batch_size=batch_size)
+            if peptide_values:
+                peptide_mean = torch.tensor(peptide_values, device=out["sample_atom_coords"].device, dtype=torch.float32).mean()
+                self.log("val/weighted_rmsd_peptide", peptide_mean, prog_bar=False, sync_dist=True, batch_size=batch_size)
+
+
+            output_dir = Path(getattr(self.validation_args, "val_cif_out_dir", "validation_outputs"))
+            write_validation_predictions(
+                out=out,
+                batch=batch,
+                base_structures=base_structures,
+                record_ids=record_ids,
+                sample_metrics=sample_metrics,
+                n_samples=n_samples,
+                output_dir=output_dir,
             )
-        except RuntimeError as e:  # catch out of memory exceptions
+
+
+        except RuntimeError as e:
             if "out of memory" in str(e):
                 print("| WARNING: ran out of memory, skipping batch")
                 torch.cuda.empty_cache()
@@ -689,193 +917,6 @@ class Boltz1(LightningModule):
                 return
             else:
                 raise e
-        # if the multiplicity used is > 1 then we take the best lddt of the different samples
-        # AF3 combines this with the confidence based filtering
-        best_lddt_dict, best_total_dict = {}, {}
-        best_complex_lddt_dict, best_complex_total_dict = {}, {}
-        B = true_coords.shape[0] // n_samples
-        if n_samples > 1:
-            # NOTE: we can change the way we aggregate the lddt
-            complex_total = 0
-            complex_lddt = 0
-            for key in all_lddt_dict.keys():
-                complex_lddt += all_lddt_dict[key] * all_total_dict[key]
-                complex_total += all_total_dict[key]
-            complex_lddt /= complex_total + 1e-7
-            best_complex_idx = complex_lddt.reshape(-1, n_samples).argmax(dim=1)
-            for key in all_lddt_dict:
-                best_idx = all_lddt_dict[key].reshape(-1, n_samples).argmax(dim=1)
-                best_lddt_dict[key] = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), best_idx
-                ]
-                best_total_dict[key] = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), best_idx
-                ]
-                best_complex_lddt_dict[key] = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), best_complex_idx
-                ]
-                best_complex_total_dict[key] = all_total_dict[key].reshape(
-                    -1, n_samples
-                )[torch.arange(B), best_complex_idx]
-        else:
-            best_lddt_dict = all_lddt_dict
-            best_total_dict = all_total_dict
-            best_complex_lddt_dict = all_lddt_dict
-            best_complex_total_dict = all_total_dict
-
-        # Filtering based on confidence
-        if self.confidence_prediction and n_samples > 1:
-            # note: for now we don't have pae predictions so have to use pLDDT instead of pTM
-            # also, while AF3 differentiates the best prediction per confidence type we are currently not doing it
-            # consider this in the future as well as weighing the different pLLDT types before aggregation
-            mae_plddt_dict, total_mae_plddt_dict = compute_plddt_mae(
-                pred_atom_coords=out["sample_atom_coords"],
-                feats=batch,
-                true_atom_coords=true_coords,
-                pred_lddt=out["plddt"],
-                true_coords_resolved_mask=true_coords_resolved_mask,
-                multiplicity=n_samples,
-            )
-            mae_pde_dict, total_mae_pde_dict = compute_pde_mae(
-                pred_atom_coords=out["sample_atom_coords"],
-                feats=batch,
-                true_atom_coords=true_coords,
-                pred_pde=out["pde"],
-                true_coords_resolved_mask=true_coords_resolved_mask,
-                multiplicity=n_samples,
-            )
-            mae_pae_dict, total_mae_pae_dict = compute_pae_mae(
-                pred_atom_coords=out["sample_atom_coords"],
-                feats=batch,
-                true_atom_coords=true_coords,
-                pred_pae=out["pae"],
-                true_coords_resolved_mask=true_coords_resolved_mask,
-                multiplicity=n_samples,
-            )
-
-            plddt = out["complex_plddt"].reshape(-1, n_samples)
-            top1_idx = plddt.argmax(dim=1)
-            iplddt = out["complex_iplddt"].reshape(-1, n_samples)
-            iplddt_top1_idx = iplddt.argmax(dim=1)
-            pde = out["complex_pde"].reshape(-1, n_samples)
-            pde_top1_idx = pde.argmin(dim=1)
-            ipde = out["complex_ipde"].reshape(-1, n_samples)
-            ipde_top1_idx = ipde.argmin(dim=1)
-            ptm = out["ptm"].reshape(-1, n_samples)
-            ptm_top1_idx = ptm.argmax(dim=1)
-            iptm = out["iptm"].reshape(-1, n_samples)
-            iptm_top1_idx = iptm.argmax(dim=1)
-            ligand_iptm = out["ligand_iptm"].reshape(-1, n_samples)
-            ligand_iptm_top1_idx = ligand_iptm.argmax(dim=1)
-            protein_iptm = out["protein_iptm"].reshape(-1, n_samples)
-            protein_iptm_top1_idx = protein_iptm.argmax(dim=1)
-
-            for key in all_lddt_dict:
-                top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), top1_idx
-                ]
-                top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), top1_idx
-                ]
-                iplddt_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), iplddt_top1_idx
-                ]
-                iplddt_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), iplddt_top1_idx
-                ]
-                pde_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), pde_top1_idx
-                ]
-                pde_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), pde_top1_idx
-                ]
-                ipde_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ipde_top1_idx
-                ]
-                ipde_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ipde_top1_idx
-                ]
-                ptm_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ptm_top1_idx
-                ]
-                ptm_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ptm_top1_idx
-                ]
-                iptm_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), iptm_top1_idx
-                ]
-                iptm_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), iptm_top1_idx
-                ]
-                ligand_iptm_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ligand_iptm_top1_idx
-                ]
-                ligand_iptm_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), ligand_iptm_top1_idx
-                ]
-                protein_iptm_top1_lddt = all_lddt_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), protein_iptm_top1_idx
-                ]
-                protein_iptm_top1_total = all_total_dict[key].reshape(-1, n_samples)[
-                    torch.arange(B), protein_iptm_top1_idx
-                ]
-
-                self.top1_lddt[key].update(top1_lddt, top1_total)
-                self.iplddt_top1_lddt[key].update(iplddt_top1_lddt, iplddt_top1_total)
-                self.pde_top1_lddt[key].update(pde_top1_lddt, pde_top1_total)
-                self.ipde_top1_lddt[key].update(ipde_top1_lddt, ipde_top1_total)
-                self.ptm_top1_lddt[key].update(ptm_top1_lddt, ptm_top1_total)
-                self.iptm_top1_lddt[key].update(iptm_top1_lddt, iptm_top1_total)
-                self.ligand_iptm_top1_lddt[key].update(
-                    ligand_iptm_top1_lddt, ligand_iptm_top1_total
-                )
-                self.protein_iptm_top1_lddt[key].update(
-                    protein_iptm_top1_lddt, protein_iptm_top1_total
-                )
-
-                self.avg_lddt[key].update(all_lddt_dict[key], all_total_dict[key])
-                self.pde_mae[key].update(mae_pde_dict[key], total_mae_pde_dict[key])
-                self.pae_mae[key].update(mae_pae_dict[key], total_mae_pae_dict[key])
-
-            for key in mae_plddt_dict:
-                self.plddt_mae[key].update(
-                    mae_plddt_dict[key], total_mae_plddt_dict[key]
-                )
-
-        for m in const.out_types:
-            if m == "ligand_protein":
-                if torch.any(
-                    batch["pocket_feature"][
-                        :, :, const.pocket_contact_info["POCKET"]
-                    ].bool()
-                ):
-                    self.lddt["pocket_ligand_protein"].update(
-                        best_lddt_dict[m], best_total_dict[m]
-                    )
-                    self.disto_lddt["pocket_ligand_protein"].update(
-                        disto_lddt_dict[m], disto_total_dict[m]
-                    )
-                    self.complex_lddt["pocket_ligand_protein"].update(
-                        best_complex_lddt_dict[m], best_complex_total_dict[m]
-                    )
-                else:
-                    self.lddt["ligand_protein"].update(
-                        best_lddt_dict[m], best_total_dict[m]
-                    )
-                    self.disto_lddt["ligand_protein"].update(
-                        disto_lddt_dict[m], disto_total_dict[m]
-                    )
-                    self.complex_lddt["ligand_protein"].update(
-                        best_complex_lddt_dict[m], best_complex_total_dict[m]
-                    )
-            else:
-                self.lddt[m].update(best_lddt_dict[m], best_total_dict[m])
-                self.disto_lddt[m].update(disto_lddt_dict[m], disto_total_dict[m])
-                self.complex_lddt[m].update(
-                    best_complex_lddt_dict[m], best_complex_total_dict[m]
-                )
-        self.rmsd.update(rmsds)
-        self.best_rmsd.update(best_rmsds)
 
     def on_validation_epoch_end(self):
         avg_lddt = {}

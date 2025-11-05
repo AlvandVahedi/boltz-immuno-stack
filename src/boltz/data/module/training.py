@@ -171,12 +171,18 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
             "amino_acids_symmetries",
             "ligand_symmetries",
         ]:
-            # Check if all have the same shape
-            shape = values[0].shape
-            if not all(v.shape == shape for v in values):
-                values, _ = pad_to_max(values, 0)
+            first_value = values[0]
+            if isinstance(first_value, torch.Tensor):
+                # Check if all have the same shape
+                shape = first_value.shape
+                if not all(v.shape == shape for v in values):
+                    values, _ = pad_to_max(values, 0)
+                else:
+                    values = torch.stack(values, dim=0)
             else:
-                values = torch.stack(values, dim=0)
+                # Keep list for non-tensor entries (e.g. record ids)
+                collated[key] = values
+                continue
 
         # Stack the values
         collated[key] = values
@@ -469,6 +475,11 @@ class ValidationDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
             return self.__getitem__(0)
+
+        features["record_id"] = record.id
+        features["structure_path"] = str(
+            (dataset.target_dir / "structures" / f"{record.id}.npz").resolve()
+        )
 
         return features
 

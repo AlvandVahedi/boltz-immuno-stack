@@ -8,6 +8,11 @@ from boltz.model.loss.confidence import (
 )
 from boltz.model.loss.diffusion import weighted_rigid_align
 
+import math
+from dataclasses import dataclass
+from typing import List
+from torch import Tensor
+
 
 def factored_lddt_loss(
     true_atom_coords,
@@ -1023,3 +1028,120 @@ def weighted_minimum_rmsd_single(
         / torch.sum(align_weights * atom_mask, dim=-1)
     )
     return rmsd, atom_coords_aligned_ground_truth, align_weights
+
+@dataclass
+class SampleMetrics:
+    sample_idx: int
+    rmsd_whole: float
+    rmsd_peptide: float
+
+
+def compute_weighted_mhc_rmsds(
+    out: dict,
+    true_coords: Tensor,
+    batch: dict,
+    peptide_mask: Tensor,
+    n_samples: int,
+    nucleotide_weight: float,
+    ligand_weight: float,
+) -> List[SampleMetrics]:
+    """Compute weighted RMSDs for whole MHC chain and peptide subset.
+
+    Parameters
+    ----------
+    out : dict
+        Model outputs containing ``sample_atom_coords``.
+    true_coords : Tensor
+        Reference coordinates matching each diffusion sample.
+    batch : dict
+        Original batch features (masks, mapping, etc.).
+    peptide_mask : Tensor
+        Boolean mask selecting peptide atoms per structure.
+    n_samples : int
+        Number of diffusion samples per structure.
+    nucleotide_weight : float
+        Weight multiplier for nucleic acid atoms.
+    ligand_weight : float
+        Weight multiplier for ligand atoms.
+
+    Returns
+    -------
+    list[SampleMetrics]
+        Metrics per diffusion sample.
+    """
+    device = out["sample_atom_coords"].device
+    total_samples = out["sample_atom_coords"].shape[0]
+    denom = max(n_samples, 1)
+
+    metrics: List[SampleMetrics] = []
+
+    for sample_idx in range(total_samples):
+        struct_idx = sample_idx // denom
+        pred_sample = out["sample_atom_coords"][sample_idx : sample_idx + 1]
+        ref_sample = true_coords[sample_idx : sample_idx + 1]
+
+        atom_mask_full = (
+            batch["atom_resolved_mask"][struct_idx : struct_idx + 1]
+            .to(device=device)
+            .float()
+        )
+        atom_to_token_full = (
+            batch["atom_to_token"][struct_idx : struct_idx + 1]
+            .float()
+            .to(device=device)
+        )
+        mol_type_full = batch["mol_type"][struct_idx : struct_idx + 1].to(device=device)
+
+        try:
+            whole_rmsd_tensor, _, _ = weighted_minimum_rmsd_single(
+                pred_sample,
+                ref_sample,
+                atom_mask_full,
+                atom_to_token_full,
+                mol_type_full,
+                nucleotide_weight=nucleotide_weight,
+                ligand_weight=ligand_weight,
+            )
+            whole_rmsd = whole_rmsd_tensor.item()
+        except Exception as e:  # noqa: BLE001
+            print(f"Weighted RMSD (MHC Chain) failed for sample {sample_idx}: {e}")
+            whole_rmsd = float("nan")
+
+        peptide_mask_row = (
+            peptide_mask[struct_idx : struct_idx + 1]
+            .to(device=device)
+            .float()
+        )
+        try:
+            if peptide_mask_row.sum() >= 3:
+                peptide_rmsd_tensor, _, _ = weighted_minimum_rmsd_single(
+                    pred_sample,
+                    ref_sample,
+                    peptide_mask_row,
+                    atom_to_token_full,
+                    mol_type_full,
+                    nucleotide_weight=nucleotide_weight,
+                    ligand_weight=ligand_weight,
+                )
+                peptide_rmsd = peptide_rmsd_tensor.item()
+            else:
+                peptide_rmsd = float("nan")
+        except Exception as e:  # noqa: BLE001
+            print(f"Weighted RMSD (peptide) failed for sample {sample_idx}: {e}")
+            peptide_rmsd = float("nan")
+
+        print(f"Sample {sample_idx} weighted RMSD (MHC Chain): {whole_rmsd:.3f}Å")
+        if math.isnan(peptide_rmsd):
+            print(f"Sample {sample_idx} weighted RMSD (peptide): nan")
+        else:
+            print(f"Sample {sample_idx} weighted RMSD (peptide): {peptide_rmsd:.3f}Å")
+
+        metrics.append(
+            SampleMetrics(
+                sample_idx=sample_idx,
+                rmsd_whole=whole_rmsd,
+                rmsd_peptide=peptide_rmsd,
+            )
+        )
+
+    return metrics
