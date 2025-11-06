@@ -290,6 +290,97 @@ def atomic_save_cif(filepath: Path, content: str) -> bool:
         return False
 
 
+def write_validation_predictions(
+    out: dict[str, Tensor],
+    batch: dict[str, Tensor],
+    base_structures: list[Optional[Structure]],
+    record_ids: list[str],
+    sample_metrics: Iterable[SampleMetrics],
+    n_samples: int,
+    output_dir: Path,
+) -> None:
+    """
+    Write validation predictions to disk.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_metrics = list(sample_metrics)
+    metrics_map = {metric.sample_idx: metric for metric in sample_metrics}
+    total_samples = out["sample_atom_coords"].shape[0]
+    samples_per_structure = n_samples if n_samples > 0 else total_samples
+    atom_pad_mask_cpu = batch["atom_pad_mask"].detach().cpu()
+
+    for struct_idx, record_id in enumerate(record_ids):
+        base_structure = base_structures[struct_idx] if struct_idx < len(base_structures) else None
+        if base_structure is None:
+            print(f"Skipping CIF write for record '{record_id}' (missing base structure).")
+            continue
+
+        valid_mask = atom_pad_mask_cpu[struct_idx].to(dtype=torch.bool).numpy()
+        if valid_mask.sum() != base_structure.atoms.shape[0]:
+            print(
+                f"Warning: atom count mismatch for record '{record_id}': "
+                f"mask has {int(valid_mask.sum())} atoms, structure has {base_structure.atoms.shape[0]}."
+            )
+            continue
+
+        sample_block = out["sample_atom_coords"][
+            struct_idx * samples_per_structure : (struct_idx + 1) * samples_per_structure
+        ]
+
+        for sample_offset, coords_tensor in enumerate(sample_block):
+            sample_idx = struct_idx * samples_per_structure + sample_offset
+            metrics = metrics_map.get(sample_idx)
+
+            try:
+                coords_np = coords_tensor.detach().cpu().numpy()[valid_mask]
+                atoms = base_structure.atoms.copy()
+                atoms["coords"] = coords_np.astype(np.float32)
+                atoms["conformer"] = coords_np.astype(np.float32)
+                atoms["is_present"] = True
+
+                residues = base_structure.residues.copy()
+                residues["is_present"] = True
+
+                new_structure = Structure(
+                    atoms=atoms,
+                    bonds=base_structure.bonds,
+                    residues=residues,
+                    chains=base_structure.chains,
+                    connections=base_structure.connections,
+                    interfaces=base_structure.interfaces,
+                    mask=base_structure.mask,
+                )
+
+                plddts = None
+                if "plddt" in out:
+                    start = struct_idx * samples_per_structure + sample_offset
+                    plddts = out["plddt"][start : start + 1].detach().cpu()
+
+                if metrics is not None:
+                    filename = (
+                        f"prediction_{record_id}_sample_{sample_idx}"
+                        f"_whole{metrics.rmsd_whole:.2f}_pep{metrics.rmsd_peptide:.2f}.cif"
+                    )
+                else:
+                    filename = f"prediction_{record_id}_sample_{sample_idx}.cif"
+
+                output_path = output_dir / filename
+                print(f"\nSaving prediction to {output_path}")
+
+                cif_content = to_mmcif(new_structure, plddts=plddts)
+                if atomic_save_cif(output_path, cif_content):
+                    print(f"Successfully saved prediction to {output_path}")
+
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error processing record '{record_id}' sample {sample_idx}: {exc}")
+                continue
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+
 class BoltzAffinityWriter(BasePredictionWriter):
     """Custom writer for predictions."""
 

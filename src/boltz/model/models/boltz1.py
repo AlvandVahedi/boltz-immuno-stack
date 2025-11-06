@@ -31,6 +31,7 @@ from boltz.model.loss.validation import (
     weighted_minimum_rmsd,
 )
 from boltz.model.modules.confidence import ConfidenceModule
+from boltz.data.write.writer import write_validation_predictions
 from boltz.model.modules.diffusion import AtomDiffusion
 from boltz.model.modules.encoders import RelativePositionEncoder
 from boltz.model.modules.trunk import (
@@ -125,10 +126,6 @@ class Boltz1(LightningModule):
                 self.plddt_mae[m] = MeanMetric()
         self.rmsd = MeanMetric()
         self.best_rmsd = MeanMetric()
-        self.mask_rmsd_metric = MeanMetric()
-        self.best_mask_rmsd_metric = MeanMetric()
-        self.latest_mask_rmsd = None
-        self.latest_best_mask_rmsd = None
 
         self.train_confidence_loss_logger = MeanMetric()
         self.train_confidence_loss_dict_logger = nn.ModuleDict()
@@ -416,7 +413,6 @@ class Boltz1(LightningModule):
         diffusion_samples,
         symmetry_correction,
         lddt_minimization=True,
-        return_aligned_coords: bool = False,
     ):
         if symmetry_correction:
             min_coords_routine = (
@@ -427,7 +423,6 @@ class Boltz1(LightningModule):
             true_coords = []
             true_coords_resolved_mask = []
             rmsds, best_rmsds = [], []
-            aligned_coords_list = []
             for idx in range(batch["token_index"].shape[0]):
                 best_rmsd = float("inf")
                 for rep in range(diffusion_samples):
@@ -444,18 +439,11 @@ class Boltz1(LightningModule):
                     rmsds.append(rmsd)
                     true_coords.append(best_true_coords)
                     true_coords_resolved_mask.append(best_true_coords_resolved_mask)
-                    if return_aligned_coords:
-                        aligned_coords_list.append(best_true_coords)
                     if rmsd < best_rmsd:
                         best_rmsd = rmsd
                 best_rmsds.append(best_rmsd)
             true_coords = torch.cat(true_coords, dim=0)
             true_coords_resolved_mask = torch.cat(true_coords_resolved_mask, dim=0)
-            aligned_true_coords = (
-                torch.cat(aligned_coords_list, dim=0)
-                if return_aligned_coords
-                else None
-            )
         else:
             true_coords = (
                 batch["coords"].squeeze(1).repeat_interleave(diffusion_samples, 0)
@@ -464,28 +452,14 @@ class Boltz1(LightningModule):
             true_coords_resolved_mask = batch["atom_resolved_mask"].repeat_interleave(
                 diffusion_samples, 0
             )
-            result = weighted_minimum_rmsd(
+            rmsds, best_rmsds = weighted_minimum_rmsd(
                 out["sample_atom_coords"],
                 batch,
                 multiplicity=diffusion_samples,
                 nucleotide_weight=self.nucleotide_rmsd_weight,
                 ligand_weight=self.ligand_rmsd_weight,
-                return_aligned_coords=return_aligned_coords,
             )
-            if return_aligned_coords:
-                rmsds, best_rmsds, aligned_true_coords = result
-            else:
-                rmsds, best_rmsds = result
-                aligned_true_coords = None
 
-        if return_aligned_coords:
-            return (
-                true_coords,
-                rmsds,
-                best_rmsds,
-                true_coords_resolved_mask,
-                aligned_true_coords,
-            )
         return true_coords, rmsds, best_rmsds, true_coords_resolved_mask
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
@@ -880,12 +854,11 @@ class Boltz1(LightningModule):
                 raise e
 
         try:
-            true_coords, _, _, _, aligned_true_coords = self.get_true_coordinates(
+            true_coords, _, _, _ = self.get_true_coordinates(
                 batch=batch,
                 out=out,
                 diffusion_samples=n_samples,
                 symmetry_correction=self.validation_args.symmetry_correction,
-                return_aligned_coords=True,
             )
 
 
@@ -924,49 +897,16 @@ class Boltz1(LightningModule):
                 self.log("val/weighted_rmsd_peptide", peptide_mean, prog_bar=False, sync_dist=True, batch_size=batch_size)
 
 
-            device = out["sample_atom_coords"].device
-            total_samples = out["sample_atom_coords"].shape[0]
-            samples_per_structure = n_samples if n_samples > 0 else total_samples
-            if total_samples != len(record_ids) * samples_per_structure:
-                raise ValueError("Mismatch between diffusion samples and batch structures.")
-
-            peptide_mask = peptide_calc_mask.to(device=device)
-            peptide_mask = peptide_mask.repeat_interleave(samples_per_structure, dim=0)
-            aligned_true_coords = aligned_true_coords.to(device)
-
-            diff = out["sample_atom_coords"] - aligned_true_coords
-            mask_float = peptide_mask.float()
-            mask_counts = mask_float.sum(dim=1)
-            valid_samples = mask_counts > 0
-
-            mask_rmsd = torch.full(
-                (total_samples,), float("nan"), device=device, dtype=diff.dtype
+            output_dir = Path(getattr(self.validation_args, "val_cif_out_dir", "validation_outputs"))
+            write_validation_predictions(
+                out=out,
+                batch=batch,
+                base_structures=base_structures,
+                record_ids=record_ids,
+                sample_metrics=sample_metrics,
+                n_samples=n_samples,
+                output_dir=output_dir,
             )
-            if valid_samples.any():
-                sq = (diff[valid_samples] ** 2).sum(dim=-1)
-                mask_rmsd[valid_samples] = torch.sqrt(
-                    (sq * mask_float[valid_samples]).sum(dim=1) / mask_counts[valid_samples]
-                )
-
-            mask_rmsd_valid = mask_rmsd[valid_samples]
-            if mask_rmsd_valid.numel() > 0:
-                self.mask_rmsd_metric.update(mask_rmsd_valid.detach().cpu())
-
-            best_mask_rmsd = torch.full(
-                (len(record_ids),), float("nan"), device=device, dtype=diff.dtype
-            )
-            mask_rmsd_matrix = mask_rmsd.view(len(record_ids), samples_per_structure)
-            valid_matrix = valid_samples.view(len(record_ids), samples_per_structure)
-            for idx in range(len(record_ids)):
-                if valid_matrix[idx].any():
-                    best_mask_rmsd[idx] = mask_rmsd_matrix[idx][valid_matrix[idx]].min()
-
-            best_mask_valid = best_mask_rmsd[torch.isfinite(best_mask_rmsd)]
-            if best_mask_valid.numel() > 0:
-                self.best_mask_rmsd_metric.update(best_mask_valid.detach().cpu())
-
-            self.latest_mask_rmsd = mask_rmsd.detach().cpu()
-            self.latest_best_mask_rmsd = best_mask_rmsd.detach().cpu()
 
 
         except RuntimeError as e:
@@ -982,22 +922,6 @@ class Boltz1(LightningModule):
         avg_lddt = {}
         avg_disto_lddt = {}
         avg_complex_lddt = {}
-
-        mask_rmsd_val = self.mask_rmsd_metric.compute()
-        if torch.isfinite(mask_rmsd_val).item():
-            self.log("val/mask_rmsd", mask_rmsd_val, prog_bar=False, sync_dist=True)
-        self.mask_rmsd_metric.reset()
-
-        best_mask_rmsd_val = self.best_mask_rmsd_metric.compute()
-        if torch.isfinite(best_mask_rmsd_val).item():
-            self.log(
-                "val/best_mask_rmsd",
-                best_mask_rmsd_val,
-                prog_bar=False,
-                sync_dist=True,
-            )
-        self.best_mask_rmsd_metric.reset()
-
         if self.confidence_prediction:
             avg_top1_lddt = {}
             avg_iplddt_top1_lddt = {}
