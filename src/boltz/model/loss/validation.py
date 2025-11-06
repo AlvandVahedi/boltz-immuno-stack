@@ -900,6 +900,7 @@ def weighted_minimum_rmsd(
     multiplicity=1,
     nucleotide_weight=5.0,
     ligand_weight=10.0,
+    return_aligned_coords: bool = False,
 ):
     """Compute rmsd of the aligned atom coordinates.
 
@@ -960,6 +961,9 @@ def weighted_minimum_rmsd(
         / torch.sum(align_weights * atom_mask, dim=-1)
     )
     best_rmsd = torch.min(rmsd.reshape(-1, multiplicity), dim=1).values
+
+    if return_aligned_coords:
+        return rmsd, best_rmsd, atom_coords_aligned_ground_truth
 
     return rmsd, best_rmsd
 
