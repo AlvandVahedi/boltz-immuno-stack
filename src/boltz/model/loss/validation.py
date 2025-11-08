@@ -8,9 +8,7 @@ from boltz.model.loss.confidence import (
 )
 from boltz.model.loss.diffusion import weighted_rigid_align
 
-import math
 from dataclasses import dataclass
-from typing import List
 from torch import Tensor
 
 
@@ -900,6 +898,8 @@ def weighted_minimum_rmsd(
     multiplicity=1,
     nucleotide_weight=5.0,
     ligand_weight=10.0,
+    alignment_mask=None,
+    rmsd_mask=None,
 ):
     """Compute rmsd of the aligned atom coordinates.
 
@@ -927,6 +927,27 @@ def weighted_minimum_rmsd(
     atom_mask = feats["atom_resolved_mask"]
     atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
+    target_len = pred_atom_coords.shape[0]
+    base_len = feats["coords"].shape[0]
+
+    def _prepare_mask(mask, fallback):
+        if mask is None:
+            prepared = fallback
+        else:
+            if mask.shape[0] == target_len:
+                prepared = mask
+            elif mask.shape[0] == base_len and base_len * multiplicity == target_len:
+                prepared = mask.repeat_interleave(multiplicity, 0)
+            else:
+                raise ValueError(
+                    "Unexpected mask shape: "
+                    f"{mask.shape[0]} (expected {target_len} or {base_len})."
+                )
+        return prepared.to(dtype=fallback.dtype, device=pred_atom_coords.device)
+
+    align_mask = _prepare_mask(alignment_mask, atom_mask)
+    calc_mask = _prepare_mask(rmsd_mask, atom_mask)
+
     align_weights = atom_coords.new_ones(atom_coords.shape[:2])
     atom_type = (
         torch.bmm(
@@ -950,14 +971,15 @@ def weighted_minimum_rmsd(
 
     with torch.no_grad():
         atom_coords_aligned_ground_truth = weighted_rigid_align(
-            atom_coords, pred_atom_coords, align_weights, mask=atom_mask
+            atom_coords, pred_atom_coords, align_weights, mask=align_mask
         )
 
     # weighted MSE loss of denoised atom positions
     mse_loss = ((pred_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
+    denom = torch.sum(align_weights * calc_mask, dim=-1)
     rmsd = torch.sqrt(
-        torch.sum(mse_loss * align_weights * atom_mask, dim=-1)
-        / torch.sum(align_weights * atom_mask, dim=-1)
+        torch.sum(mse_loss * align_weights * calc_mask, dim=-1)
+        / torch.clamp(denom, min=1e-8)
     )
     best_rmsd = torch.min(rmsd.reshape(-1, multiplicity), dim=1).values
 
@@ -972,6 +994,8 @@ def weighted_minimum_rmsd_single(
     mol_type,
     nucleotide_weight=5.0,
     ligand_weight=10.0,
+    alignment_mask=None,
+    rmsd_mask=None,
 ):
     """Compute rmsd of the aligned atom coordinates.
 
@@ -1017,15 +1041,18 @@ def weighted_minimum_rmsd_single(
     )
 
     with torch.no_grad():
+        mask_align = alignment_mask if alignment_mask is not None else atom_mask
         atom_coords_aligned_ground_truth = weighted_rigid_align(
-            atom_coords, pred_atom_coords, align_weights, mask=atom_mask
+            atom_coords, pred_atom_coords, align_weights, mask=mask_align
         )
 
     # weighted MSE loss of denoised atom positions
+    calc_mask = rmsd_mask if rmsd_mask is not None else atom_mask
     mse_loss = ((pred_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
+    denom = torch.sum(align_weights * calc_mask, dim=-1)
     rmsd = torch.sqrt(
-        torch.sum(mse_loss * align_weights * atom_mask, dim=-1)
-        / torch.sum(align_weights * atom_mask, dim=-1)
+        torch.sum(mse_loss * align_weights * calc_mask, dim=-1)
+        / torch.clamp(denom, min=1e-8)
     )
     return rmsd, atom_coords_aligned_ground_truth, align_weights
 
@@ -1033,115 +1060,4 @@ def weighted_minimum_rmsd_single(
 class SampleMetrics:
     sample_idx: int
     rmsd_whole: float
-    rmsd_peptide: float
-
-
-def compute_weighted_mhc_rmsds(
-    out: dict,
-    true_coords: Tensor,
-    batch: dict,
-    peptide_mask: Tensor,
-    n_samples: int,
-    nucleotide_weight: float,
-    ligand_weight: float,
-) -> List[SampleMetrics]:
-    """Compute weighted RMSDs for whole MHC chain and peptide subset.
-
-    Parameters
-    ----------
-    out : dict
-        Model outputs containing ``sample_atom_coords``.
-    true_coords : Tensor
-        Reference coordinates matching each diffusion sample.
-    batch : dict
-        Original batch features (masks, mapping, etc.).
-    peptide_mask : Tensor
-        Boolean mask selecting peptide atoms per structure.
-    n_samples : int
-        Number of diffusion samples per structure.
-    nucleotide_weight : float
-        Weight multiplier for nucleic acid atoms.
-    ligand_weight : float
-        Weight multiplier for ligand atoms.
-
-    Returns
-    -------
-    list[SampleMetrics]
-        Metrics per diffusion sample.
-    """
-    device = out["sample_atom_coords"].device
-    total_samples = out["sample_atom_coords"].shape[0]
-    denom = max(n_samples, 1)
-
-    metrics: List[SampleMetrics] = []
-
-    for sample_idx in range(total_samples):
-        struct_idx = sample_idx // denom
-        pred_sample = out["sample_atom_coords"][sample_idx : sample_idx + 1]
-        ref_sample = true_coords[sample_idx : sample_idx + 1]
-
-        atom_mask_full = (
-            batch["atom_resolved_mask"][struct_idx : struct_idx + 1]
-            .to(device=device)
-            .float()
-        )
-        atom_to_token_full = (
-            batch["atom_to_token"][struct_idx : struct_idx + 1]
-            .float()
-            .to(device=device)
-        )
-        mol_type_full = batch["mol_type"][struct_idx : struct_idx + 1].to(device=device)
-
-        try:
-            whole_rmsd_tensor, _, _ = weighted_minimum_rmsd_single(
-                pred_sample,
-                ref_sample,
-                atom_mask_full,
-                atom_to_token_full,
-                mol_type_full,
-                nucleotide_weight=nucleotide_weight,
-                ligand_weight=ligand_weight,
-            )
-            whole_rmsd = whole_rmsd_tensor.item()
-        except Exception as e:  # noqa: BLE001
-            print(f"Weighted RMSD (MHC Chain) failed for sample {sample_idx}: {e}")
-            whole_rmsd = float("nan")
-
-        peptide_mask_row = (
-            peptide_mask[struct_idx : struct_idx + 1]
-            .to(device=device)
-            .float()
-        )
-        try:
-            if peptide_mask_row.sum() >= 3:
-                peptide_rmsd_tensor, _, _ = weighted_minimum_rmsd_single(
-                    pred_sample,
-                    ref_sample,
-                    peptide_mask_row,
-                    atom_to_token_full,
-                    mol_type_full,
-                    nucleotide_weight=nucleotide_weight,
-                    ligand_weight=ligand_weight,
-                )
-                peptide_rmsd = peptide_rmsd_tensor.item()
-            else:
-                peptide_rmsd = float("nan")
-        except Exception as e:  # noqa: BLE001
-            print(f"Weighted RMSD (peptide) failed for sample {sample_idx}: {e}")
-            peptide_rmsd = float("nan")
-
-        print(f"Sample {sample_idx} weighted RMSD (MHC Chain): {whole_rmsd:.3f}Å")
-        if math.isnan(peptide_rmsd):
-            print(f"Sample {sample_idx} weighted RMSD (peptide): nan")
-        else:
-            print(f"Sample {sample_idx} weighted RMSD (peptide): {peptide_rmsd:.3f}Å")
-
-        metrics.append(
-            SampleMetrics(
-                sample_idx=sample_idx,
-                rmsd_whole=whole_rmsd,
-                rmsd_peptide=peptide_rmsd,
-            )
-        )
-
-    return metrics
+    rmsd_masked: float

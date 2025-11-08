@@ -1,9 +1,8 @@
 import json
 import os
-import gc
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -14,7 +13,6 @@ from torch import Tensor
 from boltz.data.types import Coords, Interface, Record, Structure, StructureV2
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
-from boltz.model.loss.validation import SampleMetrics
 
 
 class BoltzWriter(BasePredictionWriter):
@@ -69,9 +67,12 @@ class BoltzWriter(BasePredictionWriter):
 
         # Get the predictions
         coords = prediction["coords"]
-        coords = coords.unsqueeze(0)
-
+        if coords.ndim == 3:
+            coords = coords.unsqueeze(0)
         pad_masks = prediction["masks"]
+        structure_paths = prediction.get("structure_paths")
+        provided_structures = prediction.get("structures")
+        custom_filenames = prediction.get("filenames")
 
         # Get ranking
         if "confidence_score" in prediction:
@@ -82,22 +83,39 @@ class BoltzWriter(BasePredictionWriter):
             idx_to_rank = {i: i for i in range(len(records))}
 
         # Iterate over the records
-        for record, coord, pad_mask in zip(records, coords, pad_masks):
+        for rec_idx, (record, coord, pad_mask) in enumerate(zip(records, coords, pad_masks)):
             # Load the structure
-            path = self.data_dir / f"{record.id}.npz"
-            if self.boltz2:
-                structure: StructureV2 = StructureV2.load(path)
+            if provided_structures is not None and rec_idx < len(provided_structures):
+                structure = provided_structures[rec_idx]
+                chain_map = {
+                    int(chain["asym_id"]): int(chain["asym_id"])
+                    for chain in structure.chains
+                }
             else:
-                structure: Structure = Structure.load(path)
+                if structure_paths is not None and rec_idx < len(structure_paths):
+                    path = Path(structure_paths[rec_idx])
+                else:
+                    path = self.data_dir / f"{record.id}.npz"
+                if self.boltz2:
+                    structure: StructureV2 = StructureV2.load(path)
+                else:
+                    structure: Structure = Structure.load(path)
 
-            # Compute chain map with masked removed, to be used later
-            chain_map = {}
-            for i, mask in enumerate(structure.mask):
-                if mask:
-                    chain_map[len(chain_map)] = i
+                # Compute chain map with masked removed, to be used later
+                chain_map = {}
+                for i, mask in enumerate(structure.mask):
+                    if mask:
+                        chain_map[len(chain_map)] = i
 
-            # Remove masked chains completely
-            structure = structure.remove_invalid_chains()
+                # Remove masked chains completely
+                structure = structure.remove_invalid_chains()
+
+            custom_names = None
+            if custom_filenames is not None and rec_idx < len(custom_filenames):
+                custom_names = custom_filenames[rec_idx]
+
+            ext_map = {"mmcif": "cif", "pdb": "pdb"}
+            out_ext = ext_map.get(self.output_format, "npz")
 
             for model_idx in range(coord.shape[0]):
                 # Get model coord
@@ -159,24 +177,29 @@ class BoltzWriter(BasePredictionWriter):
                     plddts = prediction["plddt"][model_idx]
 
                 # Create path name
-                outname = f"{record.id}_model_{idx_to_rank[model_idx]}"
+                if custom_names and model_idx < len(custom_names):
+                    name = custom_names[model_idx]
+                    if Path(name).suffix:
+                        filename = name
+                    else:
+                        filename = f"{name}.{out_ext}"
+                else:
+                    filename = f"{record.id}_model_{idx_to_rank[model_idx]}.{out_ext}"
+                output_path = struct_dir / filename
 
                 # Save the structure
                 if self.output_format == "pdb":
-                    path = struct_dir / f"{outname}.pdb"
-                    with path.open("w") as f:
+                    with output_path.open("w") as f:
                         f.write(
                             to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
                         )
                 elif self.output_format == "mmcif":
-                    path = struct_dir / f"{outname}.cif"
-                    with path.open("w") as f:
+                    with output_path.open("w") as f:
                         f.write(
                             to_mmcif(new_structure, plddts=plddts, boltz2=self.boltz2)
                         )
                 else:
-                    path = struct_dir / f"{outname}.npz"
-                    np.savez_compressed(path, **asdict(new_structure))
+                    np.savez_compressed(output_path, **asdict(new_structure))
 
                 if self.boltz2 and record.affinity and idx_to_rank[model_idx] == 0:
                     path = struct_dir / f"pre_affinity_{record.id}.npz"
@@ -288,97 +311,6 @@ def atomic_save_cif(filepath: Path, content: str) -> bool:
         if tmp_path.exists():
             tmp_path.unlink()
         return False
-
-
-def write_validation_predictions(
-    out: dict[str, Tensor],
-    batch: dict[str, Tensor],
-    base_structures: list[Optional[Structure]],
-    record_ids: list[str],
-    sample_metrics: Iterable[SampleMetrics],
-    n_samples: int,
-    output_dir: Path,
-) -> None:
-    """
-    Write validation predictions to disk.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    sample_metrics = list(sample_metrics)
-    metrics_map = {metric.sample_idx: metric for metric in sample_metrics}
-    total_samples = out["sample_atom_coords"].shape[0]
-    samples_per_structure = n_samples if n_samples > 0 else total_samples
-    atom_pad_mask_cpu = batch["atom_pad_mask"].detach().cpu()
-
-    for struct_idx, record_id in enumerate(record_ids):
-        base_structure = base_structures[struct_idx] if struct_idx < len(base_structures) else None
-        if base_structure is None:
-            print(f"Skipping CIF write for record '{record_id}' (missing base structure).")
-            continue
-
-        valid_mask = atom_pad_mask_cpu[struct_idx].to(dtype=torch.bool).numpy()
-        if valid_mask.sum() != base_structure.atoms.shape[0]:
-            print(
-                f"Warning: atom count mismatch for record '{record_id}': "
-                f"mask has {int(valid_mask.sum())} atoms, structure has {base_structure.atoms.shape[0]}."
-            )
-            continue
-
-        sample_block = out["sample_atom_coords"][
-            struct_idx * samples_per_structure : (struct_idx + 1) * samples_per_structure
-        ]
-
-        for sample_offset, coords_tensor in enumerate(sample_block):
-            sample_idx = struct_idx * samples_per_structure + sample_offset
-            metrics = metrics_map.get(sample_idx)
-
-            try:
-                coords_np = coords_tensor.detach().cpu().numpy()[valid_mask]
-                atoms = base_structure.atoms.copy()
-                atoms["coords"] = coords_np.astype(np.float32)
-                atoms["conformer"] = coords_np.astype(np.float32)
-                atoms["is_present"] = True
-
-                residues = base_structure.residues.copy()
-                residues["is_present"] = True
-
-                new_structure = Structure(
-                    atoms=atoms,
-                    bonds=base_structure.bonds,
-                    residues=residues,
-                    chains=base_structure.chains,
-                    connections=base_structure.connections,
-                    interfaces=base_structure.interfaces,
-                    mask=base_structure.mask,
-                )
-
-                plddts = None
-                if "plddt" in out:
-                    start = struct_idx * samples_per_structure + sample_offset
-                    plddts = out["plddt"][start : start + 1].detach().cpu()
-
-                if metrics is not None:
-                    filename = (
-                        f"prediction_{record_id}_sample_{sample_idx}"
-                        f"_whole{metrics.rmsd_whole:.2f}_pep{metrics.rmsd_peptide:.2f}.cif"
-                    )
-                else:
-                    filename = f"prediction_{record_id}_sample_{sample_idx}.cif"
-
-                output_path = output_dir / filename
-                print(f"\nSaving prediction to {output_path}")
-
-                cif_content = to_mmcif(new_structure, plddts=plddts)
-                if atomic_save_cif(output_path, cif_content):
-                    print(f"Successfully saved prediction to {output_path}")
-
-            except Exception as exc:  # noqa: BLE001
-                print(f"Error processing record '{record_id}' sample {sample_idx}: {exc}")
-                continue
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
 
 
 class BoltzAffinityWriter(BasePredictionWriter):
