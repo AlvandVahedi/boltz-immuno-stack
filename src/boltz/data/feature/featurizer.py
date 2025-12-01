@@ -31,6 +31,38 @@ from boltz.model.modules.utils import center_random_augmentation
 ####################################################################################################
 
 
+def safe_one_hot(
+    tensor: torch.Tensor,
+    num_classes: int,
+    field_name: str,
+    record_id: Optional[str] = None,
+    fallback_value: Optional[int] = 1,
+) -> torch.Tensor:
+    """One-hot encode while guarding against invalid class indices."""
+    record = record_id or "unknown"
+    fallback = 1 if fallback_value is None else fallback_value
+    tensor_long = torch.as_tensor(tensor).long()
+    if tensor_long.numel() > 0:
+        min_val = int(tensor_long.min().item())
+        max_val = int(tensor_long.max().item())
+        if min_val < 0:
+            print(
+                f"[BoltzFeaturizer] {field_name} contained negative class value "
+                f"{min_val} for record {record}. Replacing with {fallback}."
+            )
+            tensor_long = torch.where(
+                tensor_long < 0, torch.full_like(tensor_long, fallback), tensor_long
+            )
+        if max_val >= num_classes:
+            print(
+                f"[BoltzFeaturizer] {field_name} contained out-of-range class value "
+                f"{max_val} (>= {num_classes}) for record {record}. "
+                f"Clamping to {num_classes - 1}."
+            )
+            tensor_long = torch.clamp(tensor_long, max=num_classes - 1)
+    return one_hot(tensor_long, num_classes=num_classes)
+
+
 def compute_frames_nonpolymer(
     data: Tokenized,
     coords,
@@ -926,7 +958,13 @@ def process_msa_features(
     )  # (N_MSA, N_RES, N_AA)
 
     # Prepare features
-    msa = torch.nn.functional.one_hot(msa, num_classes=const.num_tokens)
+    msa = safe_one_hot(
+        msa,
+        num_classes=const.num_tokens,
+        field_name="msa",
+        record_id=getattr(getattr(data, "record", None), "id", "unknown"),
+        fallback_value=1,
+    )
     msa_mask = torch.ones_like(msa[:, :, 0])
     profile = msa.float().mean(dim=0)
     has_deletion = deletion > 0

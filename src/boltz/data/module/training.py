@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import traceback
 
 import numpy as np
 import pytorch_lightning as pl
@@ -81,75 +82,43 @@ class Dataset:
     tokenizer: Tokenizer
     featurizer: BoltzFeaturizer
 
+ALIGN_CHAIN_PREFIXES = {"A", "B"}
+RMSD_CHAIN_PREFIXES = {"C", "D"}
 
-def _prepare_structure(data: np.lib.npyio.NpzFile) -> tuple[Structure, Optional[np.ndarray], Optional[np.ndarray]]:
-    chains = data["chains"]
-    if "cyclic_period" not in chains.dtype.names:
-        new_dtype = chains.dtype.descr + [("cyclic_period", "i4")]
-        new_chains = np.empty(chains.shape, dtype=new_dtype)
-        for name in chains.dtype.names:
-            new_chains[name] = chains[name]
-        new_chains["cyclic_period"] = 0
-        chains = new_chains
+def _first_alpha(name: str) -> str:
+    for ch in name.upper():
+        if ch.isalpha():
+            return ch
+    return ""
 
-    structure = Structure(
-        atoms=data["atoms"],
-        bonds=data["bonds"],
-        residues=data["residues"],
-        chains=chains,
-        connections=data["connections"].astype(Connection),
-        interfaces=data["interfaces"],
-        mask=data["mask"],
-    )
+def _recompute_masks(
+    structure: Structure, record: Record, chain_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    num_atoms = structure.atoms.shape[0]
+    alignment_mask = np.zeros(num_atoms, dtype=bool)
+    rmsd_mask = np.zeros(num_atoms, dtype=bool)
 
-    alignment_mask = data.get("alignment_mask")
-    rmsd_mask = data.get("rmsd_mask")
-
-    if alignment_mask is not None:
-        alignment_mask = alignment_mask.astype(bool, copy=False)
-    if rmsd_mask is not None:
-        rmsd_mask = rmsd_mask.astype(bool, copy=False)
-
-    chain_mask = data["mask"].astype(bool)
-    kept_atom_total = sum(
-        int(chain["atom_num"]) for idx, chain in enumerate(data["chains"]) if chain_mask[idx]
-    )
-
-    def _reshape_mask(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        if mask is None:
-            return None
-        if mask.shape[0] == kept_atom_total:
-            return mask
-
-        segments = []
-        for idx, chain in enumerate(data["chains"]):
-            if not chain_mask[idx]:
-                continue
-            start = int(chain["atom_idx"])
-            end = start + int(chain["atom_num"])
-            segments.append(mask[start:end])
-        if any(seg.size == 0 for seg in segments):
-            return None
-        return np.concatenate(segments)
-
-    alignment_mask = _reshape_mask(alignment_mask)
-    rmsd_mask = _reshape_mask(rmsd_mask)
-
-    structure_clean = structure.remove_invalid_chains()
-
-    if alignment_mask is not None and alignment_mask.shape[0] != structure_clean.atoms.shape[0]:
+    kept_chains = [c for c, keep in zip(record.chains, chain_mask) if keep]
+    if len(kept_chains) != len(structure.chains):
         print(
-            f"Alignment mask length mismatch for structure ({alignment_mask.shape[0]} vs {structure_clean.atoms.shape[0]}). Discarding mask."
+            f"Chain count mismatch (record={len(kept_chains)}, structure={len(structure.chains)}). Skipping fresh masks."
         )
-        alignment_mask = None
-    if rmsd_mask is not None and rmsd_mask.shape[0] != structure_clean.atoms.shape[0]:
-        print(
-            f"rmsd mask length mismatch for structure ({rmsd_mask.shape[0]} vs {structure_clean.atoms.shape[0]}). Discarding mask."
-        )
-        rmsd_mask = None
+        return alignment_mask, rmsd_mask
 
-    return structure_clean, alignment_mask, rmsd_mask
-
+    # Map chain_name to masks using manifest info (rather than first-letter heuristics).
+    for idx, (struct_chain, rec_chain) in enumerate(zip(structure.chains, kept_chains)):
+        start = int(struct_chain["atom_idx"])
+        end = start + int(struct_chain["atom_num"])
+        name = str(rec_chain.chain_name).upper()
+        prefix = _first_alpha(name)
+        if prefix in ALIGN_CHAIN_PREFIXES:
+            print(f'@@@@@@@ Setting alignment mask for chain {name} @@@@@@@')
+            alignment_mask[start:end] = True
+        if prefix in RMSD_CHAIN_PREFIXES:
+            print(f'@@@@@@@ Setting RMSD mask for chain {name} @@@@@@@')
+            rmsd_mask[start:end] = True
+    print(f'@@@@@@@@@ Alignment mask sum: {alignment_mask.sum()}, RMSD mask sum: {rmsd_mask.sum()} @@@@@@@')
+    return alignment_mask, rmsd_mask
 
 def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
     """Load the given input data.
@@ -170,9 +139,32 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
 
     """
     # Load the structure
-    structure_path = target_dir / "structures" / f"{record.id}.npz"
-    npz_data = np.load(structure_path)
-    structure, alignment_mask, rmsd_mask = _prepare_structure(npz_data)
+    npz_data = np.load(target_dir / "structures" / f"{record.id}.npz")
+    
+    chain_mask = npz_data["mask"].astype(bool)
+    
+    chains = npz_data["chains"]
+    if "cyclic_period" not in chains.dtype.names:
+        new_dtype = chains.dtype.descr + [("cyclic_period", "i4")]
+        new_chains = np.empty(chains.shape, dtype=new_dtype)
+        for name in chains.dtype.names:
+            new_chains[name] = chains[name]
+        new_chains["cyclic_period"] = 0
+        chains = new_chains
+
+    structure = Structure(
+        atoms=npz_data["atoms"],
+        bonds=npz_data["bonds"],
+        residues=npz_data["residues"],
+        chains=chains,
+        connections=npz_data["connections"].astype(Connection),
+        interfaces=npz_data["interfaces"],
+        mask=npz_data["mask"],
+    )
+    structure = structure.remove_invalid_chains()
+
+    # Compute alignment and rmsd masks in dataloading step
+    alignment_mask, rmsd_mask = _recompute_masks(structure, record, chain_mask)
 
     msas = {}
     for chain in record.chains:
@@ -375,8 +367,15 @@ class TrainingDataset(torch.utils.data.Dataset):
                 compute_constraint_features=self.compute_constraint_features,
             )
         except Exception as e:
-            print(f"Featurizer failed on {sample.record.id} with error {e}. Skipping.")
+            tb = traceback.format_exc()
+            print(
+                f"Featurizer failed on {sample.record.id} with error {e}. Skipping.\n{tb}"
+            )
             return self.__getitem__(idx)
+
+        features["chain_name"] = [
+            str(name) for name in tokenized.structure.chains["name"]
+        ]
 
         return features
 
@@ -523,11 +522,13 @@ class ValidationDataset(torch.utils.data.Dataset):
                 compute_constraint_features=self.compute_constraint_features,
             )
         except Exception as e:
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
+            tb = traceback.format_exc()
+            print(f"Featurizer failed on {record.id} with error {e}. Skipping.\n{tb}")
             return self.__getitem__(0)
 
         features["record_id"] = record.id
         features["record"] = record
+        features["chain_name"] = [str(name) for name in input_data.structure.chains["name"]]
         if input_data.alignment_mask is not None:
             features["alignment_mask"] = torch.from_numpy(
                 input_data.alignment_mask.astype(np.bool_)
@@ -537,7 +538,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                 input_data.rmsd_mask.astype(np.bool_)
             )
         features["base_structure"] = input_data.structure
-        features["structure_path"] = str(
+        features["structure_path"] = str( # Just for cif writing in validation step
             (dataset.target_dir / "structures" / f"{record.id}.npz").resolve()
         )
 

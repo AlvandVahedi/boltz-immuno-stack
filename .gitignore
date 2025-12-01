@@ -171,3 +171,5 @@ natives/
 cache/
 mhc_one_sample/
 val_cif_output/
+new_tcr_mhc2/
+tcr_mhc2/

@@ -89,6 +89,17 @@ def weighted_rigid_align(
         einsum(true_coords_centered, rot_matrix, "b n i, b j i -> b n j")
         + pred_centroid
     )
+    # Debug rotation/translation once: rotation is rot_matrix (3x3), translation is pred_centroid
+    try:
+        if batch_size <= 2 and not getattr(weighted_rigid_align, "_printed_once", False):
+            for b in range(batch_size):
+                rot = rot_matrix[b].detach().cpu().numpy()
+                trans = pred_centroid[b, 0].detach().cpu().numpy()
+                print(f"[rigid-align] batch {b} rotation:\n{rot}")
+                print(f"[rigid-align] batch {b} translation: {trans.tolist()}")
+            weighted_rigid_align._printed_once = True
+    except Exception:
+        pass
     aligned_coords.detach_()
 
     return aligned_coords

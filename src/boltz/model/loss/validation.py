@@ -900,6 +900,7 @@ def weighted_minimum_rmsd(
     ligand_weight=10.0,
     alignment_mask=None,
     rmsd_mask=None,
+    ca_only: bool = False,
 ):
     """Compute rmsd of the aligned atom coordinates.
 
@@ -926,6 +927,7 @@ def weighted_minimum_rmsd(
 
     atom_mask = feats["atom_resolved_mask"]
     atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+    print(f'##### inside validation weighted_minimum_rmsd: atom_mask.shape = {atom_mask.shape} #####')
 
     target_len = pred_atom_coords.shape[0]
     base_len = feats["coords"].shape[0]
@@ -946,6 +948,7 @@ def weighted_minimum_rmsd(
         return prepared.to(dtype=fallback.dtype, device=pred_atom_coords.device)
 
     align_mask = _prepare_mask(alignment_mask, atom_mask)
+    # print(f'##### inside validation weighted_minimum_rmsd: rmsd shape: {rmsd_mask.shape if rmsd_mask is not None else 0} and rmsdmask.sum = {rmsd_mask.sum() if rmsd_mask is not None else 0} #####')
     calc_mask = _prepare_mask(rmsd_mask, atom_mask)
 
     align_weights = atom_coords.new_ones(atom_coords.shape[:2])
@@ -969,6 +972,27 @@ def weighted_minimum_rmsd(
         * torch.eq(atom_type, const.chain_type_ids["NONPOLYMER"]).float()
     )
 
+    # CA-only filtering (apply to both alignment and calc masks)
+    if ca_only and "asym_id" in feats and "residue_index" in feats:
+        asym_id = feats["asym_id"].repeat_interleave(multiplicity, 0)
+        residue_index = feats["residue_index"].repeat_interleave(multiplicity, 0)
+        atom_to_tok = feats["atom_to_token"].repeat_interleave(multiplicity, 0)
+        ca_mask = torch.zeros_like(calc_mask, dtype=torch.bool, device=calc_mask.device)
+        combined = (align_mask | calc_mask).bool()
+        for b in range(pred_atom_coords.shape[0]):
+            tok_idx = atom_to_tok[b].argmax(dim=-1)
+            chain_ids = asym_id[b][tok_idx]
+            res_ids = residue_index[b][tok_idx]
+            seen = set()
+            for idx in torch.nonzero(combined[b], as_tuple=False).squeeze(-1):
+                key = (int(chain_ids[idx].item()), int(res_ids[idx].item()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                ca_mask[b, idx] = True
+        align_mask = align_mask & ca_mask
+        calc_mask = calc_mask & ca_mask
+
     with torch.no_grad():
         atom_coords_aligned_ground_truth = weighted_rigid_align(
             atom_coords, pred_atom_coords, align_weights, mask=align_mask
@@ -976,6 +1000,8 @@ def weighted_minimum_rmsd(
 
     # weighted MSE loss of denoised atom positions
     mse_loss = ((pred_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
+    # print(f'##### inside validation weighted_minimum_rmsd: mse_loss.sum = {mse_loss.sum()} #####')
+    # print(f'##### inside validation weighted_minimum_rmsd: calc_mask.sum = {calc_mask.sum()} #####')
     denom = torch.sum(align_weights * calc_mask, dim=-1)
     rmsd = torch.sqrt(
         torch.sum(mse_loss * align_weights * calc_mask, dim=-1)
@@ -983,8 +1009,9 @@ def weighted_minimum_rmsd(
     )
     best_rmsd = torch.min(rmsd.reshape(-1, multiplicity), dim=1).values
 
-    return rmsd, best_rmsd
+    print(f'##### rmsd and best rmsd values: {rmsd}, {best_rmsd} #####')
 
+    return rmsd, best_rmsd
 
 def weighted_minimum_rmsd_single(
     pred_atom_coords,
@@ -996,6 +1023,14 @@ def weighted_minimum_rmsd_single(
     ligand_weight=10.0,
     alignment_mask=None,
     rmsd_mask=None,
+    asym_id=None,
+    residue_index=None,
+    chain_names=None,
+    debug_alignment: bool = False,
+    debug_alignment_samples: int = 6,
+    ca_only: bool = True,
+    debug_distances: bool = False,
+    skip_alignment: bool = False,
 ):
     """Compute rmsd of the aligned atom coordinates.
 
@@ -1041,19 +1076,124 @@ def weighted_minimum_rmsd_single(
     )
 
     with torch.no_grad():
-        mask_align = alignment_mask if alignment_mask is not None else atom_mask
-        atom_coords_aligned_ground_truth = weighted_rigid_align(
-            atom_coords, pred_atom_coords, align_weights, mask=mask_align
-        )
+        if skip_alignment:
+            atom_coords_aligned_ground_truth = atom_coords
+        else:
+            mask_align = alignment_mask if alignment_mask is not None else atom_mask
+            mask_align = mask_align.bool() & atom_mask.bool()
+            atom_coords_aligned_ground_truth = weighted_rigid_align(
+                atom_coords, pred_atom_coords, align_weights, mask=mask_align
+            )
 
     # weighted MSE loss of denoised atom positions
     calc_mask = rmsd_mask if rmsd_mask is not None else atom_mask
+    calc_mask = calc_mask.bool() & atom_mask.bool()
+
+    if ca_only and asym_id is not None and residue_index is not None:
+        # Keep only one atom (CA) per residue in the calc_mask
+        ca_mask = torch.zeros_like(calc_mask, dtype=torch.bool)
+        batch_size = calc_mask.shape[0]
+        for b in range(batch_size):
+            atom_to_tok_idx = atom_to_token[b].argmax(dim=-1)
+            chain_ids = asym_id[b][atom_to_tok_idx]
+            res_ids = residue_index[b][atom_to_tok_idx]
+            seen = set()
+            for idx in torch.nonzero(calc_mask[b], as_tuple=False).squeeze(-1):
+                rid = (int(chain_ids[idx]), int(res_ids[idx]))
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                ca_mask[b, idx] = True
+        calc_mask = calc_mask & ca_mask
+
     mse_loss = ((pred_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(dim=-1)
     denom = torch.sum(align_weights * calc_mask, dim=-1)
     rmsd = torch.sqrt(
         torch.sum(mse_loss * align_weights * calc_mask, dim=-1)
         / torch.clamp(denom, min=1e-8)
     )
+
+    if debug_alignment and asym_id is not None and residue_index is not None:
+        batch_size = mse_loss.shape[0]
+        for b in range(batch_size):
+            atom_to_tok_idx = atom_to_token[b].argmax(dim=-1)
+            chain_ids = asym_id[b][atom_to_tok_idx]
+            res_ids = residue_index[b][atom_to_tok_idx]
+            chain_types = (
+                torch.bmm(
+                    atom_to_token[b].unsqueeze(0).float(),
+                    mol_type[b].unsqueeze(0).unsqueeze(-1).float(),
+                )
+                .squeeze(0)
+                .squeeze(-1)
+                .long()
+            )
+            calc_mask_b = calc_mask[b] > 0
+            # When skip_alignment=True the reference is assumed pre-aligned, so show
+            # the predicted coords as the "after" position to keep the debug useful.
+            base_coords = atom_coords[b]
+            aligned_coords = (
+                pred_atom_coords[b]
+                if skip_alignment
+                else atom_coords_aligned_ground_truth[b]
+            )
+
+            for chain in torch.unique(chain_ids):
+                chain_token_mask = chain_ids == chain
+                protein_mask = chain_types != const.chain_type_ids["NONPOLYMER"]
+                if not (chain_token_mask & protein_mask).any():
+                    continue
+
+                chain_res_ids = torch.unique(res_ids[chain_token_mask])
+                if chain_res_ids.numel() == 0:
+                    continue
+                per_res_rmsd = []
+                for rid in chain_res_ids:
+                    # CA-only: take the first atom for each residue (assumed CA after masking)
+                    res_mask = (
+                        calc_mask_b & chain_token_mask & (res_ids == rid) & protein_mask
+                    )
+                    if res_mask.any():
+                        atom_indices = torch.nonzero(res_mask, as_tuple=False).squeeze(-1)
+                        if atom_indices.numel() == 0:
+                            continue
+                        ca_idx = atom_indices[0]
+                        ca_mask = torch.zeros_like(res_mask)
+                        ca_mask[ca_idx] = True
+                        rms_val = torch.sqrt(
+                            torch.clamp(mse_loss[b][ca_mask].mean(), min=0.0)
+                        ).item()
+                        per_res_rmsd.append((int(rid.item()), rms_val, int(ca_idx.item())))
+                if not per_res_rmsd:
+                    continue
+                per_res_rmsd.sort(key=lambda x: x[1], reverse=True)
+                take = per_res_rmsd[:debug_alignment_samples]
+
+                chain_label = None
+                if chain_names is not None:
+                    try:
+                        chain_label = chain_names[b][int(chain.item())]
+                    except Exception:
+                        pass
+                chain_display = (
+                    f"{chain_label} (id={int(chain.item())})"
+                    if chain_label not in (None, "None")
+                    else f"id={int(chain.item())}"
+                )
+
+                # print(f"[alignment-debug] chain {chain_display}")
+                # for rid, rms_val, ca_idx in take:
+                #     atom_mask_res = (
+                #         calc_mask_b & chain_token_mask & (res_ids == rid) & protein_mask
+                #     )
+                #     if not atom_mask_res.any():
+                #         continue
+                #     before = base_coords[ca_idx : ca_idx + 1].detach().cpu().numpy().tolist()
+                #     after = aligned_coords[ca_idx : ca_idx + 1].detach().cpu().numpy().tolist()
+                #     print(
+                #         f"  residue {rid}: rmsd={rms_val:.3f}, atom_idx={ca_idx}, CA before {before} after {after}"
+                #     )
+
     return rmsd, atom_coords_aligned_ground_truth, align_weights
 
 @dataclass
