@@ -6,11 +6,6 @@ from pathlib import Path
 from typing import Optional
 import random
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-SRC_DIR = ROOT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
 import hydra
 import omegaconf
 import pytorch_lightning as pl
@@ -76,7 +71,7 @@ class TrainConfig:
     matmul_precision: Optional[str] = None
     find_unused_parameters: Optional[bool] = False
     save_top_k: Optional[int] = 1
-    validation_only: bool = True
+    validation_only: bool = False
     debug: bool = False
     strict_loading: bool = True
     load_confidence_from_trunk: Optional[bool] = False
