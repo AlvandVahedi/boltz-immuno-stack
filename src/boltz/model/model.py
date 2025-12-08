@@ -1,7 +1,10 @@
 import gc
 import random
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch._dynamo
 from pytorch_lightning import LightningModule
@@ -10,12 +13,16 @@ from torchmetrics import MeanMetric
 
 import boltz.model.layers.initialize as init
 from boltz.data import const
+from boltz.data.module.utils import ensure_cyclic_period_field
 from boltz.data.feature.symmetry import (
     minimum_lddt_symmetry_coords,
     minimum_symmetry_coords,
 )
+from boltz.data.types import Structure
+from boltz.data.write.mmcif import to_mmcif
 from boltz.model.loss.confidence import confidence_loss
 from boltz.model.loss.distogram import distogram_loss
+from boltz.model.loss.diffusion import weighted_rigid_align
 from boltz.model.loss.validation import (
     compute_pae_mae,
     compute_pde_mae,
@@ -429,6 +436,179 @@ class Boltz1(LightningModule):
 
         return true_coords, rmsds, best_rmsds, true_coords_resolved_mask
 
+    def compute_validation_rmsds(
+        self,
+        batch: dict[str, Tensor],
+        true_coords: Tensor,
+        pred_coords: Tensor,
+        diffusion_samples: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        alignment_atom_mask = batch.get("alignment_atom_mask")
+        rmsd_atom_mask = batch.get("rmsd_atom_mask")
+        if alignment_atom_mask is None or rmsd_atom_mask is None:
+            zeros = torch.zeros(true_coords.shape[0], device=true_coords.device)
+            return zeros, zeros, zeros.clone(), zeros.clone(), pred_coords.detach()
+
+        device = true_coords.device
+        dtype = true_coords.dtype
+        alignment_atom_mask = alignment_atom_mask.to(device=device, dtype=dtype)
+        rmsd_atom_mask = rmsd_atom_mask.to(device=device, dtype=dtype)
+        atom_pad_mask = batch["atom_pad_mask"].to(device=device, dtype=dtype)
+        atom_resolved_mask = batch["atom_resolved_mask"].to(device=device, dtype=dtype)
+        token_to_rep_atom = batch["token_to_rep_atom"].to(device=device).float()
+
+        ca_atom_mask = torch.amax(token_to_rep_atom, dim=1)
+        ca_atom_mask = ca_atom_mask * atom_pad_mask * atom_resolved_mask
+
+        alignment_mask = alignment_atom_mask * ca_atom_mask
+        rmsd_mask = rmsd_atom_mask * ca_atom_mask
+
+        alignment_mask = alignment_mask.repeat_interleave(diffusion_samples, dim=0)
+        rmsd_mask = rmsd_mask.repeat_interleave(diffusion_samples, dim=0)
+        fallback_mask = (atom_resolved_mask * atom_pad_mask).repeat_interleave(
+            diffusion_samples, dim=0
+        )
+
+        has_alignment = alignment_mask.sum(dim=-1, keepdim=True) > 0
+        alignment_mask_for_transform = torch.where(
+            has_alignment,
+            alignment_mask,
+            fallback_mask,
+        )
+        align_weights = torch.ones_like(alignment_mask_for_transform)
+
+        with torch.no_grad():
+            aligned_pred_coords = weighted_rigid_align(
+                pred_coords,
+                true_coords,
+                align_weights,
+                alignment_mask_for_transform,
+            )
+
+        diff = aligned_pred_coords - true_coords
+        alignment_rmsd, alignment_counts = self._masked_rmsd(diff, alignment_mask)
+        masked_rmsd, masked_counts = self._masked_rmsd(diff, rmsd_mask)
+        return (
+            alignment_rmsd,
+            alignment_counts,
+            masked_rmsd,
+            masked_counts,
+            aligned_pred_coords,
+        )
+
+    @staticmethod
+    def _masked_rmsd(diff: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        mask = mask.to(diff.dtype)
+        counts = mask.sum(dim=-1)
+        rmsd = torch.zeros_like(counts)
+        valid = counts > 0
+        if torch.any(valid):
+            squared_error = diff.pow(2).sum(dim=-1)
+            error = (squared_error * mask).sum(dim=-1)
+            rmsd[valid] = torch.sqrt(error[valid] / counts[valid].clamp_min(1e-8))
+        return rmsd, counts
+
+    @staticmethod
+    def _structure_with_coords(structure: Structure, coords: Tensor) -> Structure:
+        coord_array = np.asarray(coords)
+        atoms = structure.atoms.copy()
+        residues = structure.residues.copy()
+        atoms["coords"] = coord_array
+        atoms["is_present"] = True
+        residues["is_present"] = True
+        return replace(structure, atoms=atoms, residues=residues)
+
+    def write_validation_cifs(
+        self,
+        batch: dict[str, Any],
+        raw_pred_coords: Tensor,
+        aligned_pred_coords: Tensor,
+        diffusion_samples: int,
+    ) -> None:
+        if not getattr(self.validation_args, "write_cif_for_validation", False):
+            return
+        record_ids = batch.get("record_id")
+        structure_paths = batch.get("structure_path")
+        if record_ids is None or structure_paths is None:
+            return
+        if not isinstance(record_ids, (list, tuple)):
+            record_ids = [record_ids]
+        if not isinstance(structure_paths, (list, tuple)):
+            structure_paths = [structure_paths]
+        record_ids = list(record_ids)
+        structure_paths = list(structure_paths)
+        if len(record_ids) != len(structure_paths):
+            print(f"Metadata length mismatch: ids={len(record_ids)} paths={len(structure_paths)}.")
+        output_dir = Path(self.validation_args.val_cif_out_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        atom_pad_mask = batch["atom_pad_mask"]
+        batch_limit = min(len(record_ids), len(structure_paths), atom_pad_mask.shape[0])
+        if batch_limit == 0:
+            print("Empty metadata batch, skipping CIF writing.")
+            return
+        wrote_any = False
+        for b_idx in range(batch_limit):
+            record_name = str(record_ids[b_idx])
+            if not record_name:
+                continue
+            print(f"Processing record {record_name} for CIF writing.")
+            structure_path = Path(str(structure_paths[b_idx]))
+            if not structure_path.exists():
+                print(f"Structure file missing for {record_name}: {structure_path}")
+                continue
+            try:
+                structure = Structure.load(structure_path)
+                if "cyclic_period" not in structure.chains.dtype.names:
+                    structure = replace(
+                        structure,
+                        chains=ensure_cyclic_period_field(structure.chains),
+                    )
+                structure = structure.remove_invalid_chains()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to load structure for {record_name} from {structure_path}: {exc}")
+                continue
+            pad_mask = atom_pad_mask[b_idx].bool()
+            sample_offset = b_idx * diffusion_samples
+            if sample_offset >= raw_pred_coords.shape[0]:
+                print(f"Sample offset {sample_offset} out of bounds for record {record_name}.")
+                continue
+            raw_coords_tensor = raw_pred_coords[sample_offset]
+            aligned_coords_tensor = aligned_pred_coords[sample_offset]
+            raw_coords = raw_coords_tensor[pad_mask].detach().cpu().numpy()
+            aligned_coords = aligned_coords_tensor[pad_mask].detach().cpu().numpy()
+            if raw_coords.shape[0] != structure.atoms.shape[0]:
+                print(
+                    f"Atom count mismatch for {record_name}: "
+                    f"preds={raw_coords.shape[0]} vs structure={structure.atoms.shape[0]}."
+                )
+                continue
+            try:
+                before_structure = self._structure_with_coords(structure, raw_coords)
+                after_structure = self._structure_with_coords(
+                    structure, aligned_coords
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to build structures for {record_name}: {exc}")
+                continue
+            record_dir = output_dir / record_name
+            record_dir.mkdir(parents=True, exist_ok=True)
+            before_path = record_dir / "prediction_before.cif"
+            after_path = record_dir / "prediction_aligned.cif"
+            ground_truth_path = record_dir / "ground_truth.cif"
+            try:
+                with before_path.open("w") as f:
+                    f.write(to_mmcif(before_structure))
+                with after_path.open("w") as f:
+                    f.write(to_mmcif(after_structure))
+                with ground_truth_path.open("w") as f:
+                    f.write(to_mmcif(structure))
+                wrote_any = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to write CIFs for {record_name}: {exc}")
+                continue
+        if not wrote_any:
+            print("No CIF files were written for this batch.")
+
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         # Sample recycling steps
         recycling_steps = random.randint(0, self.training_args.recycling_steps)
@@ -639,7 +819,7 @@ class Boltz1(LightningModule):
                 pred_d=pred_dist,
             )
 
-            true_coords, rmsds, best_rmsds, true_coords_resolved_mask = (
+            true_coords, _, _, true_coords_resolved_mask = (
                 self.get_true_coordinates(
                     batch=batch,
                     out=out,
@@ -696,6 +876,21 @@ class Boltz1(LightningModule):
             best_total_dict = all_total_dict
             best_complex_lddt_dict = all_lddt_dict
             best_complex_total_dict = all_total_dict
+
+        alignment_rmsd, alignment_counts, masked_rmsd, masked_counts, aligned_pred_coords = (
+            self.compute_validation_rmsds(
+                batch,
+                true_coords,
+                out["sample_atom_coords"],
+                n_samples,
+            )
+        )
+        self.write_validation_cifs(
+            batch,
+            out["sample_atom_coords"],
+            aligned_pred_coords,
+            n_samples,
+        )
 
         # Filtering based on confidence
         if self.confidence_prediction and n_samples > 1:
@@ -842,14 +1037,14 @@ class Boltz1(LightningModule):
                     self.complex_lddt["ligand_protein"].update(
                         best_complex_lddt_dict[m], best_complex_total_dict[m]
                     )
-            else:
-                self.lddt[m].update(best_lddt_dict[m], best_total_dict[m])
-                self.disto_lddt[m].update(disto_lddt_dict[m], disto_total_dict[m])
-                self.complex_lddt[m].update(
-                    best_complex_lddt_dict[m], best_complex_total_dict[m]
-                )
-        self.rmsd.update(rmsds)
-        self.best_rmsd.update(best_rmsds)
+        else:
+            self.lddt[m].update(best_lddt_dict[m], best_total_dict[m])
+            self.disto_lddt[m].update(disto_lddt_dict[m], disto_total_dict[m])
+            self.complex_lddt[m].update(
+                best_complex_lddt_dict[m], best_complex_total_dict[m]
+            )
+        self.rmsd.update(alignment_rmsd, alignment_counts)
+        self.best_rmsd.update(masked_rmsd, masked_counts)
 
     def on_validation_epoch_end(self):
         avg_lddt = {}
@@ -1116,12 +1311,24 @@ class Boltz1(LightningModule):
             ) / sum(const.out_types_weights.values())
             self.log("val/avg_lddt", overall_avg_lddt, prog_bar=True, sync_dist=True)
 
-        self.log("val/rmsd", self.rmsd.compute(), prog_bar=True, sync_dist=True)
+        alignment_rmsd_value = self.rmsd.compute()
+        self.log(
+            "val/alignment_rmsd",
+            alignment_rmsd_value,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self.log("val/rmsd", alignment_rmsd_value, prog_bar=False, sync_dist=True)
         self.rmsd.reset()
 
+        masked_rmsd_value = self.best_rmsd.compute()
         self.log(
-            "val/best_rmsd", self.best_rmsd.compute(), prog_bar=True, sync_dist=True
+            "val/masked_rmsd",
+            masked_rmsd_value,
+            prog_bar=True,
+            sync_dist=True,
         )
+        self.log("val/best_rmsd", masked_rmsd_value, prog_bar=False, sync_dist=True)
         self.best_rmsd.reset()
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:

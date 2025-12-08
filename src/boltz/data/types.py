@@ -148,6 +148,8 @@ class Structure(NumpySerializable):
     connections: np.ndarray
     interfaces: np.ndarray
     mask: np.ndarray
+    alignment_mask: Optional[np.ndarray] = None
+    rmsd_mask: Optional[np.ndarray] = None
 
     @classmethod
     def load(cls: "Structure", path: Path) -> "Structure":
@@ -173,6 +175,10 @@ class Structure(NumpySerializable):
             connections=structure["connections"].astype(Connection),
             interfaces=structure["interfaces"],
             mask=structure["mask"],
+            alignment_mask=structure["alignment_mask"]
+            if "alignment_mask" in structure
+            else None,
+            rmsd_mask=structure["rmsd_mask"] if "rmsd_mask" in structure else None,
         )
 
     def remove_invalid_chains(self) -> "Structure":  # noqa: PLR0915
@@ -193,6 +199,8 @@ class Structure(NumpySerializable):
         atom_idx, res_idx, chain_idx = 0, 0, 0
         atoms, residues, chains = [], [], []
         atom_map, res_map, chain_map = {}, {}, {}
+        alignment_mask = [] if self.alignment_mask is not None else None
+        rmsd_mask = [] if self.rmsd_mask is not None else None
         for i, chain in enumerate(self.chains):
             # Skip masked chains
             if not self.mask[i]:
@@ -238,6 +246,10 @@ class Structure(NumpySerializable):
                 atoms.append(self.atoms[start:end])
                 atom_map.update({k: atom_idx + k - start for k in range(start, end)})
                 atom_idx += res["atom_num"]
+                if alignment_mask is not None:
+                    alignment_mask.append(self.alignment_mask[start:end])
+                if rmsd_mask is not None:
+                    rmsd_mask.append(self.rmsd_mask[start:end])
 
         # Concatenate the tables
         atoms = np.concatenate(atoms, dtype=Atom)
@@ -279,6 +291,10 @@ class Structure(NumpySerializable):
         connections = np.array(connections, dtype=Connection)
         interfaces = np.array([], dtype=Interface)
         mask = np.ones(len(chains), dtype=bool)
+        if alignment_mask is not None:
+            alignment_mask = np.concatenate(alignment_mask)
+        if rmsd_mask is not None:
+            rmsd_mask = np.concatenate(rmsd_mask)
 
         return Structure(
             atoms=atoms,
@@ -288,6 +304,8 @@ class Structure(NumpySerializable):
             connections=connections,
             interfaces=interfaces,
             mask=mask,
+            alignment_mask=alignment_mask,
+            rmsd_mask=rmsd_mask,
         )
 
 

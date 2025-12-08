@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +13,7 @@ from boltz.data.feature.featurizer import BoltzFeaturizer
 from boltz.data.feature.pad import pad_to_max
 from boltz.data.feature.symmetry import get_symmetries
 from boltz.data.filter.dynamic.filter import DynamicFilter
+from boltz.data.module.utils import build_chain_masks, ensure_cyclic_period_field
 from boltz.data.sample.sampler import Sample, Sampler
 from boltz.data.tokenize.tokenizer import Tokenizer
 from boltz.data.types import MSA, Connection, Input, Manifest, Record, Structure
@@ -101,14 +102,24 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
     """
     # Load the structure
     structure = np.load(target_dir / "structures" / f"{record.id}.npz")
+    chains = ensure_cyclic_period_field(structure["chains"])
     structure = Structure(
         atoms=structure["atoms"],
         bonds=structure["bonds"],
         residues=structure["residues"],
-        chains=structure["chains"],
+        chains=chains,
         connections=structure["connections"].astype(Connection),
         interfaces=structure["interfaces"],
         mask=structure["mask"],
+        alignment_mask=structure["alignment_mask"]
+        if "alignment_mask" in structure
+        else None,
+        rmsd_mask=structure["rmsd_mask"] if "rmsd_mask" in structure else None,
+    )
+
+    alignment_mask, rmsd_mask = build_chain_masks(structure, record)
+    structure = replace(
+        structure, alignment_mask=alignment_mask, rmsd_mask=rmsd_mask
     )
 
     msas = {}
@@ -151,6 +162,8 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
             "chain_symmetries",
             "amino_acids_symmetries",
             "ligand_symmetries",
+            "record_id",
+            "structure_path",
         ]:
             # Check if all have the same shape
             shape = values[0].shape
@@ -218,89 +231,75 @@ class TrainingDataset(torch.utils.data.Dataset):
             self.samples.append(iterator)
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
-        """Get an item from the dataset.
-
-        Parameters
-        ----------
-        idx : int
-            The data index.
-
-        Returns
-        -------
-        dict[str, Tensor]
-            The sampled data features.
-
-        """
-        # Pick a random dataset
-        dataset_idx = np.random.choice(
-            len(self.datasets),
-            p=self.probs,
-        )
-        dataset = self.datasets[dataset_idx]
-
-        # Get a sample from the dataset
-        sample: Sample = next(self.samples[dataset_idx])
-
-        # Get the structure
-        try:
-            input_data = load_input(sample.record, dataset.target_dir, dataset.msa_dir)
-        except Exception as e:
-            print(
-                f"Failed to load input for {sample.record.id} with error {e}. Skipping."
+        """Get an item from the dataset."""
+        max_attempts = 50
+        for _ in range(max_attempts):
+            dataset_idx = np.random.choice(
+                len(self.datasets),
+                p=self.probs,
             )
-            return self.__getitem__(idx)
+            dataset = self.datasets[dataset_idx]
+            sample: Sample = next(self.samples[dataset_idx])
 
-        # Tokenize structure
-        try:
-            tokenized = dataset.tokenizer.tokenize(input_data)
-        except Exception as e:
-            print(f"Tokenizer failed on {sample.record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
-
-        # Compute crop
-        try:
-            if self.max_tokens is not None:
-                tokenized = dataset.cropper.crop(
-                    tokenized,
-                    max_atoms=self.max_atoms,
-                    max_tokens=self.max_tokens,
-                    random=np.random,
-                    chain_id=sample.chain_id,
-                    interface_id=sample.interface_id,
+            try:
+                input_data = load_input(sample.record, dataset.target_dir, dataset.msa_dir)
+            except Exception as e:
+                print(
+                    f"Failed to load input for {sample.record.id} with error {e}. Skipping."
                 )
-        except Exception as e:
-            print(f"Cropper failed on {sample.record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
+                continue
 
-        # Check if there are tokens
-        if len(tokenized.tokens) == 0:
-            msg = "No tokens in cropped structure."
-            raise ValueError(msg)
+            # Tokenize structure
+            try:
+                tokenized = dataset.tokenizer.tokenize(input_data)
+            except Exception as e:
+                print(f"Tokenizer failed on {sample.record.id} with error {e}. Skipping.")
+                continue
 
-        # Compute features
-        try:
-            features = dataset.featurizer.process(
-                tokenized,
-                training=True,
-                max_atoms=self.max_atoms if self.pad_to_max_atoms else None,
-                max_tokens=self.max_tokens if self.pad_to_max_tokens else None,
-                max_seqs=self.max_seqs,
-                pad_to_max_seqs=self.pad_to_max_seqs,
-                symmetries=self.symmetries,
-                atoms_per_window_queries=self.atoms_per_window_queries,
-                min_dist=self.min_dist,
-                max_dist=self.max_dist,
-                num_bins=self.num_bins,
-                compute_symmetries=self.return_symmetries,
-                binder_pocket_conditioned_prop=self.binder_pocket_conditioned_prop,
-                binder_pocket_cutoff=self.binder_pocket_cutoff,
-                binder_pocket_sampling_geometric_p=self.binder_pocket_sampling_geometric_p,
-            )
-        except Exception as e:
-            print(f"Featurizer failed on {sample.record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
+            try:
+                if self.max_tokens is not None:
+                    tokenized = dataset.cropper.crop(
+                        tokenized,
+                        max_atoms=self.max_atoms,
+                        max_tokens=self.max_tokens,
+                        random=np.random,
+                        chain_id=sample.chain_id,
+                        interface_id=sample.interface_id,
+                    )
+            except Exception as e:
+                print(f"Cropper failed on {sample.record.id} with error {e}. Skipping.")
+                continue
 
-        return features
+            if len(tokenized.tokens) == 0:
+                print(f"No tokens in cropped structure for {sample.record.id}.")
+                continue
+
+            try:
+                features = dataset.featurizer.process(
+                    tokenized,
+                    training=True,
+                    max_atoms=self.max_atoms if self.pad_to_max_atoms else None,
+                    max_tokens=self.max_tokens if self.pad_to_max_tokens else None,
+                    max_seqs=self.max_seqs,
+                    pad_to_max_seqs=self.pad_to_max_seqs,
+                    symmetries=self.symmetries,
+                    atoms_per_window_queries=self.atoms_per_window_queries,
+                    min_dist=self.min_dist,
+                    max_dist=self.max_dist,
+                    num_bins=self.num_bins,
+                    compute_symmetries=self.return_symmetries,
+                    binder_pocket_conditioned_prop=self.binder_pocket_conditioned_prop,
+                    binder_pocket_cutoff=self.binder_pocket_cutoff,
+                    binder_pocket_sampling_geometric_p=self.binder_pocket_sampling_geometric_p,
+                )
+            except Exception as e:
+                print(f"Featurizer failed on {sample.record.id} with error {e}. Skipping.")
+                continue
+
+            return features
+
+        msg = "Failed to fetch a valid training sample after multiple attempts."
+        raise RuntimeError(msg)
 
     def __len__(self) -> int:
         """Get the length of the dataset.
@@ -374,78 +373,100 @@ class ValidationDataset(torch.utils.data.Dataset):
             The sampled data features.
 
         """
-        # Pick dataset based on idx
-        for dataset in self.datasets:
-            size = len(dataset.manifest.records)
-            if self.overfit is not None:
-                size = min(size, self.overfit)
-            if idx < size:
-                break
-            idx -= size
+        dataset_length = len(self)
+        max_attempts = dataset_length if dataset_length > 0 else 1
+        attempt = 0
+        current_idx = idx % max_attempts if max_attempts > 0 else 0
+        while attempt < max_attempts:
+            dataset_idx = current_idx
+            dataset = None
+            for d in self.datasets:
+                size = len(d.manifest.records)
+                if self.overfit is not None:
+                    size = min(size, self.overfit)
+                if dataset_idx < size:
+                    dataset = d
+                    break
+                dataset_idx -= size
+            if dataset is None:
+                raise IndexError("Index out of range for validation dataset.")
 
-        # Get a sample from the dataset
-        record = dataset.manifest.records[idx]
+            record = dataset.manifest.records[dataset_idx]
 
-        # Get the structure
-        try:
-            input_data = load_input(record, dataset.target_dir, dataset.msa_dir)
-        except Exception as e:
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
-
-        # Tokenize structure
-        try:
-            tokenized = dataset.tokenizer.tokenize(input_data)
-        except Exception as e:
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
-
-        # Compute crop
-        try:
-            if self.crop_validation and (self.max_tokens is not None):
-                tokenized = dataset.cropper.crop(
-                    tokenized,
-                    max_tokens=self.max_tokens,
-                    random=self.random,
-                    max_atoms=self.max_atoms,
+            try:
+                input_data = load_input(record, dataset.target_dir, dataset.msa_dir)
+            except Exception as e:
+                print(
+                    f"Failed to load input for {record.id} with error {e}. Skipping."
                 )
-        except Exception as e:
-            print(f"Cropper failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+                attempt += 1
+                current_idx = (idx + attempt) % max_attempts
+                continue
 
-        # Check if there are tokens
-        if len(tokenized.tokens) == 0:
-            msg = "No tokens in cropped structure."
-            raise ValueError(msg)
+            try:
+                tokenized = dataset.tokenizer.tokenize(input_data)
+            except Exception as e:
+                print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
+                attempt += 1
+                current_idx = (idx + attempt) % max_attempts
+                continue
 
-        # Compute features
-        try:
-            pad_atoms = self.crop_validation and self.pad_to_max_atoms
-            pad_tokens = self.crop_validation and self.pad_to_max_tokens
+            try:
+                if self.crop_validation and (self.max_tokens is not None):
+                    tokenized = dataset.cropper.crop(
+                        tokenized,
+                        max_tokens=self.max_tokens,
+                        random=self.random,
+                        max_atoms=self.max_atoms,
+                    )
+            except Exception as e:
+                print(f"Cropper failed on {record.id} with error {e}. Skipping.")
+                attempt += 1
+                current_idx = (idx + attempt) % max_attempts
+                continue
 
-            features = dataset.featurizer.process(
-                tokenized,
-                training=False,
-                max_atoms=self.max_atoms if pad_atoms else None,
-                max_tokens=self.max_tokens if pad_tokens else None,
-                max_seqs=self.max_seqs,
-                pad_to_max_seqs=self.pad_to_max_seqs,
-                symmetries=self.symmetries,
-                atoms_per_window_queries=self.atoms_per_window_queries,
-                min_dist=self.min_dist,
-                max_dist=self.max_dist,
-                num_bins=self.num_bins,
-                compute_symmetries=self.return_symmetries,
-                binder_pocket_conditioned_prop=self.binder_pocket_conditioned_prop,
-                binder_pocket_cutoff=self.binder_pocket_cutoff,
-                binder_pocket_sampling_geometric_p=1.0,  # this will only sample a single pocket token
-                only_ligand_binder_pocket=True,
+            if len(tokenized.tokens) == 0:
+                print(f"No tokens in cropped structure for {record.id}.")
+                attempt += 1
+                current_idx = (idx + attempt) % max_attempts
+                continue
+
+            try:
+                pad_atoms = self.crop_validation and self.pad_to_max_atoms
+                pad_tokens = self.crop_validation and self.pad_to_max_tokens
+
+                features = dataset.featurizer.process(
+                    tokenized,
+                    training=False,
+                    max_atoms=self.max_atoms if pad_atoms else None,
+                    max_tokens=self.max_tokens if pad_tokens else None,
+                    max_seqs=self.max_seqs,
+                    pad_to_max_seqs=self.pad_to_max_seqs,
+                    symmetries=self.symmetries,
+                    atoms_per_window_queries=self.atoms_per_window_queries,
+                    min_dist=self.min_dist,
+                    max_dist=self.max_dist,
+                    num_bins=self.num_bins,
+                    compute_symmetries=self.return_symmetries,
+                    binder_pocket_conditioned_prop=self.binder_pocket_conditioned_prop,
+                    binder_pocket_cutoff=self.binder_pocket_cutoff,
+                    binder_pocket_sampling_geometric_p=1.0,
+                    only_ligand_binder_pocket=True,
+                )
+            except Exception as e:
+                print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
+                attempt += 1
+                current_idx = (idx + attempt) % max_attempts
+                continue
+
+            features["record_id"] = record.id
+            features["structure_path"] = str(
+                dataset.target_dir / "structures" / f"{record.id}.npz"
             )
-        except Exception as e:
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            return features
 
-        return features
+        msg = "Failed to fetch a valid validation sample after multiple attempts."
+        raise RuntimeError(msg)
 
     def __len__(self) -> int:
         """Get the length of the dataset.

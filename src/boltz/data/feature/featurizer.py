@@ -705,6 +705,10 @@ def process_atom_features(
     r_set_to_rep_atom = []
     disto_coords = []
     atom_idx = 0
+    alignment_mask_values = []
+    rmsd_mask_values = []
+    structure_alignment_mask = getattr(data.structure, "alignment_mask", None)
+    structure_rmsd_mask = getattr(data.structure, "rmsd_mask", None)
 
     chain_res_ids = {}
     for token_id, token in enumerate(data.tokens):
@@ -726,6 +730,15 @@ def process_atom_features(
         start = token["atom_idx"]
         end = token["atom_idx"] + token["atom_num"]
         token_atoms = data.structure.atoms[start:end]
+
+        if structure_alignment_mask is not None:
+            alignment_mask_values.append(structure_alignment_mask[start:end])
+        else:
+            alignment_mask_values.append(np.zeros(token["atom_num"], dtype=bool))
+        if structure_rmsd_mask is not None:
+            rmsd_mask_values.append(structure_rmsd_mask[start:end])
+        else:
+            rmsd_mask_values.append(np.zeros(token["atom_num"], dtype=bool))
 
         # Map token to representative atom
         token_to_rep_atom.append(atom_idx + token["disto_idx"] - start)
@@ -802,6 +815,8 @@ def process_atom_features(
     atom_data = np.concatenate(atom_data)
     coord_data = np.concatenate(coord_data, axis=1)
     ref_space_uid = np.array(ref_space_uid)
+    alignment_atom_mask = np.concatenate(alignment_mask_values).astype(np.float32)
+    rmsd_atom_mask = np.concatenate(rmsd_mask_values).astype(np.float32)
 
     # Compute features
     ref_atom_name_chars = from_numpy(atom_data["name"]).long()
@@ -814,6 +829,8 @@ def process_atom_features(
     coords = from_numpy(coord_data.copy())
     resolved_mask = from_numpy(atom_data["is_present"])
     pad_mask = torch.ones(len(atom_data), dtype=torch.float)
+    alignment_atom_mask = from_numpy(alignment_atom_mask).float()
+    rmsd_atom_mask = from_numpy(rmsd_atom_mask).float()
     atom_to_token = torch.tensor(atom_to_token, dtype=torch.long)
     token_to_rep_atom = torch.tensor(token_to_rep_atom, dtype=torch.long)
     r_set_to_rep_atom = torch.tensor(r_set_to_rep_atom, dtype=torch.long)
@@ -859,6 +876,8 @@ def process_atom_features(
         pad_mask = pad_dim(pad_mask, 0, pad_len)
         ref_pos = pad_dim(ref_pos, 0, pad_len)
         resolved_mask = pad_dim(resolved_mask, 0, pad_len)
+        alignment_atom_mask = pad_dim(alignment_atom_mask, 0, pad_len)
+        rmsd_atom_mask = pad_dim(rmsd_atom_mask, 0, pad_len)
         ref_element = pad_dim(ref_element, 0, pad_len)
         ref_charge = pad_dim(ref_charge, 0, pad_len)
         ref_atom_name_chars = pad_dim(ref_atom_name_chars, 0, pad_len)
@@ -881,6 +900,8 @@ def process_atom_features(
     return {
         "ref_pos": ref_pos,
         "atom_resolved_mask": resolved_mask,
+        "alignment_atom_mask": alignment_atom_mask,
+        "rmsd_atom_mask": rmsd_atom_mask,
         "ref_element": ref_element,
         "ref_charge": ref_charge,
         "ref_atom_name_chars": ref_atom_name_chars,
@@ -1215,6 +1236,7 @@ class BoltzFeaturizer:
 
         # Compute residue constraint features
         residue_constraint_features = {}
+        chain_constraint_features = {}
         if compute_constraint_features:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
